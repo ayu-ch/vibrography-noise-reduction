@@ -58,6 +58,43 @@ class SyntheticDataGenerator:
         
         return dx, dy
     
+    def generate_camera_sway(self, frame_idx, fps=100):
+        """Generate camera sway: low-frequency random walk [several to tens of px, large amplitude]."""
+        if not hasattr(self, '_sway_state'):
+            self._sway_state = {'x': 0.0, 'y': 0.0}
+        
+        t = frame_idx / fps
+        
+        # Low-frequency base motion (large amplitude component)
+        base_freq_x = 0.2  # Hz - low frequency
+        base_freq_y = 0.15 # Hz - low frequency  
+        base_amp_x = 15.0  # pixels - large amplitude
+        base_amp_y = 12.0  # pixels - large amplitude
+        
+        base_x = base_amp_x * np.sin(2 * np.pi * base_freq_x * t)
+        base_y = base_amp_y * np.cos(2 * np.pi * base_freq_y * t)
+        
+        # Random walk component (medium amplitude)
+        random_factor = 1.2 
+        walk_step_x = np.random.normal(0, random_factor)
+        walk_step_y = np.random.normal(0, random_factor)
+        
+        # Update random walk state with decay
+        decay = 0.92
+        self._sway_state['x'] = self._sway_state['x'] * decay + walk_step_x
+        self._sway_state['y'] = self._sway_state['y'] * decay + walk_step_y
+        
+        # Combine base motion and random walk
+        dx = base_x + self._sway_state['x']
+        dy = base_y + self._sway_state['y']
+        
+        # Clamp to specification range
+        max_displacement = 25.0 
+        dx = np.clip(dx, -max_displacement, max_displacement)
+        dy = np.clip(dy, -max_displacement, max_displacement)
+        
+        return dx, dy
+    
     def generate_dataset(self, num_frames=300, output_dir="synthetic_data"):
         Path(output_dir).mkdir(exist_ok=True)
         frames_dir = Path(output_dir) / "frames"
@@ -70,6 +107,10 @@ class SyntheticDataGenerator:
             "structural_vibration": {
                 "displacement_x": [],
                 "displacement_y": []
+            },
+            "camera_sway": {
+                "displacement_x": [],
+                "displacement_y": []
             }
         }
         
@@ -79,18 +120,29 @@ class SyntheticDataGenerator:
             if frame_idx % 50 == 0:
                 print(f"  Frame {frame_idx}/{num_frames}")
             
-            dx, dy = self.generate_structural_vibration(frame_idx)
+            struct_dx, struct_dy = self.generate_structural_vibration(frame_idx)
+            sway_dx, sway_dy = self.generate_camera_sway(frame_idx)
             
             current_frame = base_texture.copy()
-            if abs(dx) > 0.01 or abs(dy) > 0.01:
-                M = np.float32([[1, 0, dx], [0, 1, dy]])
-                current_frame = cv2.warpAffine(current_frame, M, (self.width, self.height))
+            
+            # Apply structural vibration first
+            if abs(struct_dx) > 0.01 or abs(struct_dy) > 0.01:
+                M_struct = np.float32([[1, 0, struct_dx], [0, 1, struct_dy]])
+                current_frame = cv2.warpAffine(current_frame, M_struct, (self.width, self.height))
+            
+            # Apply camera sway
+            if abs(sway_dx) > 0.01 or abs(sway_dy) > 0.01:
+                M_sway = np.float32([[1, 0, sway_dx], [0, 1, sway_dy]])
+                current_frame = cv2.warpAffine(current_frame, M_sway, (self.width, self.height))
             
             frame_path = frames_dir / f"frame_{frame_idx:04d}.png"
             cv2.imwrite(str(frame_path), current_frame)
             
-            ground_truth["structural_vibration"]["displacement_x"].append(dx)
-            ground_truth["structural_vibration"]["displacement_y"].append(dy)
+            # Store ground truth
+            ground_truth["structural_vibration"]["displacement_x"].append(struct_dx)
+            ground_truth["structural_vibration"]["displacement_y"].append(struct_dy)
+            ground_truth["camera_sway"]["displacement_x"].append(sway_dx)
+            ground_truth["camera_sway"]["displacement_y"].append(sway_dy)
         
         with open(Path(output_dir) / "ground_truth.json", 'w') as f:
             json.dump(ground_truth, f, indent=2)
