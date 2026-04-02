@@ -14,16 +14,17 @@ class SyntheticDataGenerator:
         self.height = height
         
     def create_base_texture(self):
-        """checkerboard pattern """
-        texture = np.zeros((self.height, self.width), dtype=np.uint8)
-        square_size = 40
+        """Low-contrast checkerboard"""
+        texture = np.ones((self.height, self.width), dtype=np.uint8) * 180
+        square_size = 60
         
+        # Very low contrast checkerboard (won't interfere with ArUco)
         for y in range(0, self.height, square_size):
             for x in range(0, self.width, square_size):
                 if (x // square_size + y // square_size) % 2 == 0:
-                    texture[y:y+square_size, x:x+square_size] = 220
+                    texture[y:y+square_size, x:x+square_size] = 190
                 else:
-                    texture[y:y+square_size, x:x+square_size] = 40
+                    texture[y:y+square_size, x:x+square_size] = 170
         
         return cv2.cvtColor(texture, cv2.COLOR_GRAY2BGR)
     
@@ -95,6 +96,41 @@ class SyntheticDataGenerator:
         
         return dx, dy
     
+    def generate_rotation(self, frame_idx, fps=100):
+        """Generate camera rotation: ±0.5° random rotation."""
+        t = frame_idx / fps
+        
+        # Rotation parameters
+        max_angle = 0.3  # degrees
+        frequency = 0.8  # Hz
+        
+        angle_deg = max_angle * np.sin(2 * np.pi * frequency * t)
+        
+        center_x, center_y = self.width // 2, self.height // 2
+        rotation_matrix = cv2.getRotationMatrix2D((center_x, center_y), angle_deg, 1.0)
+        
+        return angle_deg, rotation_matrix
+    
+    def apply_sensor_noise(self, image):
+        """Apply Gaussian noise"""
+        image_float = image.astype(np.float32)
+        
+        # Gaussian noise
+        gaussian_sigma = 0.5
+        gaussian_noise = np.random.normal(0, gaussian_sigma, image.shape)
+        image_float += gaussian_noise
+        
+        # Shot noise (Poisson-like)
+        shot_factor = 0.1
+        poisson_input = np.maximum(image_float * shot_factor, 0.1)
+        shot_noise = np.random.poisson(poisson_input) / shot_factor - image_float
+        image_float += shot_noise
+        
+        # Quantization (8-bit)
+        image_float = np.round(image_float * 255.0 / 255.0)
+        
+        return np.clip(image_float, 0, 255).astype(np.uint8)
+    
     def generate_dataset(self, num_frames=300, output_dir="synthetic_data"):
         Path(output_dir).mkdir(exist_ok=True)
         frames_dir = Path(output_dir) / "frames"
@@ -111,6 +147,9 @@ class SyntheticDataGenerator:
             "camera_sway": {
                 "displacement_x": [],
                 "displacement_y": []
+            },
+            "rotation": {
+                "angles": []
             }
         }
         
@@ -122,6 +161,7 @@ class SyntheticDataGenerator:
             
             struct_dx, struct_dy = self.generate_structural_vibration(frame_idx)
             sway_dx, sway_dy = self.generate_camera_sway(frame_idx)
+            angle_deg, rotation_matrix = self.generate_rotation(frame_idx)
             
             current_frame = base_texture.copy()
             
@@ -135,6 +175,13 @@ class SyntheticDataGenerator:
                 M_sway = np.float32([[1, 0, sway_dx], [0, 1, sway_dy]])
                 current_frame = cv2.warpAffine(current_frame, M_sway, (self.width, self.height))
             
+            # Apply rotation
+            if abs(angle_deg) > 0.001:
+                current_frame = cv2.warpAffine(current_frame, rotation_matrix, (self.width, self.height))
+            
+            # Apply sensor noise
+            current_frame = self.apply_sensor_noise(current_frame)
+            
             frame_path = frames_dir / f"frame_{frame_idx:04d}.png"
             cv2.imwrite(str(frame_path), current_frame)
             
@@ -143,6 +190,7 @@ class SyntheticDataGenerator:
             ground_truth["structural_vibration"]["displacement_y"].append(struct_dy)
             ground_truth["camera_sway"]["displacement_x"].append(sway_dx)
             ground_truth["camera_sway"]["displacement_y"].append(sway_dy)
+            ground_truth["rotation"]["angles"].append(angle_deg)
         
         with open(Path(output_dir) / "ground_truth.json", 'w') as f:
             json.dump(ground_truth, f, indent=2)
