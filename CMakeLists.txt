@@ -22,6 +22,12 @@ target_link_libraries(aruco_homography
     ${OpenCV_LIBS}
 )
 
+# RANSAC Stabilizer with ArUco Displacement Tracking
+add_executable(ransac_stabilizer ransac_stabilizer.cpp)
+target_link_libraries(ransac_stabilizer 
+    ${OpenCV_LIBS}
+)
+
 # Set default build type
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
