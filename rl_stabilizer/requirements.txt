@@ -1,0 +1,10 @@
+torch>=2.0
+torchvision
+stable-baselines3[extra]
+gymnasium
+tensorboard
+pyyaml
+matplotlib
+pandas
+opencv-python
+numpy

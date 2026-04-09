@@ -1,0 +1,64 @@
+# RL Stabilizer Configuration
+# SAC hyperparameters and environment settings
+
+# ── Environment ──────────────────────────────────────────────────────────────
+env:
+  fps: 100
+  episode_length: 500
+  history_length: 8          # past frames in observation
+
+  # Action bounds
+  action_bounds:
+    tx: 25.0                 # px
+    ty: 25.0                 # px
+    theta: 0.6               # degrees
+    scale_half_range: 0.02   # scale ∈ [1 - this, 1 + this]
+
+  # Normalization constants
+  norm:
+    translation: 25.0
+    rotation: 0.6
+    inlier_saturate: 400
+
+  # RANSAC noise simulation
+  ransac_noise_sigma: 1.5    # px, base σ before inlier scaling
+  ransac_inlier_mean: 300
+  ransac_inlier_std: 80
+  ransac_dropout_rate: 0.05  # 5% chance of invalid H
+
+# ── Domain randomization ranges ──────────────────────────────────────────────
+domain_randomization:
+  sway_amp_x: [4.0, 12.0]     # base sinusoidal amplitude
+  sway_amp_y: [3.0, 9.0]
+  sway_freq_x: [0.10, 0.25]   # Hz
+  sway_freq_y: [0.08, 0.20]
+  walk_sigma: [1.0, 4.0]      # random walk step σ
+  walk_ar: [0.85, 0.95]       # AR(1) decay coefficient
+  rotation_amp: [0.2, 0.8]    # degrees
+  rotation_freq: [0.4, 1.2]   # Hz
+  ransac_noise_sigma: [0.5, 3.0]
+  dropout_rate: [0.02, 0.10]
+
+# ── Reward weights ───────────────────────────────────────────────────────────
+reward:
+  rotation_weight: 100.0       # θ residual weighted higher
+  smoothness_weight: 0.1       # penalize action jitter
+  scale_weight: 1000.0         # penalize scale deviation from 1.0
+
+# ── SAC hyperparameters ──────────────────────────────────────────────────────
+sac:
+  learning_rate: 3.0e-4
+  buffer_size: 1000000
+  batch_size: 256
+  gamma: 0.99
+  tau: 0.005
+  ent_coef: auto
+  learning_starts: 10000
+  train_freq: 1
+  total_timesteps: 2000000
+  n_envs: 8
+
+# ── Policy network ───────────────────────────────────────────────────────────
+policy:
+  net_arch: [128, 128, 64]
+  use_layer_norm: true
