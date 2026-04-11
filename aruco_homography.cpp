@@ -1,8 +1,10 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/aruco.hpp>
+#include <opencv2/cudawarping.hpp>
 #include <iostream>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <filesystem>
 #include <map>
 #include <set>
@@ -27,15 +29,15 @@ public:
 
     HomographyStabilizer() {
         aruco_dict_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
-        det_params_ = cv::aruco::DetectorParameters::create();
-        
-        // detection parameters
-        det_params_->adaptiveThreshWinSizeMin = 5;
-        det_params_->adaptiveThreshWinSizeMax = 23;
-        det_params_->minMarkerPerimeterRate = 0.02;
-        det_params_->maxMarkerPerimeterRate = 4.0;
-        det_params_->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
-        det_params_->cornerRefinementWinSize = 5;
+
+        det_params_.adaptiveThreshWinSizeMin = 5;
+        det_params_.adaptiveThreshWinSizeMax = 23;
+        det_params_.minMarkerPerimeterRate = 0.02;
+        det_params_.maxMarkerPerimeterRate = 4.0;
+        det_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
+        det_params_.cornerRefinementWinSize = 5;
+
+        detector_ = cv::aruco::ArucoDetector(aruco_dict_, det_params_);
     }
 
     cv::Mat stabilize(const cv::Mat& frame, Metrics& m) {
@@ -69,10 +71,13 @@ public:
             m.used_fallback = true;
         }
 
-        // Apply stabilization
+        // Apply stabilization (GPU)
         cv::Mat stabilized;
-        cv::warpPerspective(frame, stabilized, H, frame.size(),
-                          cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        cv::cuda::GpuMat gpu_frame, gpu_stabilized;
+        gpu_frame.upload(frame);
+        cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H, frame.size(),
+                                  cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        gpu_stabilized.download(stabilized);
         
         return stabilized;
     }
@@ -90,7 +95,7 @@ private:
         std::vector<std::vector<cv::Point2f>> corners;
         std::vector<std::vector<cv::Point2f>> rejected;
 
-        cv::aruco::detectMarkers(frame, aruco_dict_, corners, ids, det_params_, rejected);
+        detector_.detectMarkers(frame, corners, ids, rejected);
 
         std::set<int> found_anchor_ids;
         std::map<int, std::vector<cv::Point2f>> anchor_corners_by_id;
@@ -163,8 +168,9 @@ private:
 
 
     // State
-    cv::Ptr<cv::aruco::Dictionary> aruco_dict_;
-    cv::Ptr<cv::aruco::DetectorParameters> det_params_;
+    cv::aruco::Dictionary aruco_dict_;
+    cv::aruco::DetectorParameters det_params_;
+    cv::aruco::ArucoDetector detector_;
     bool initialized_ = false;
     std::vector<cv::Point2f> reference_corners_;
     cv::Mat last_valid_H_;
@@ -229,22 +235,95 @@ void processDataset(const std::string& input_dir, const std::string& output_dir)
 }
 
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Video input mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+void processVideo(const std::string& video_path, const std::string& output_dir) {
+    HomographyStabilizer stabilizer;
+    fs::create_directories(output_dir);
+
+    cv::VideoCapture cap(video_path);
+    if (!cap.isOpened()) {
+        std::cerr << "Cannot open video: " << video_path << "\n";
+        return;
+    }
+
+    int total_frames = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
+    double fps       = cap.get(cv::CAP_PROP_FPS);
+    int width        = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height       = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+
+    std::cout << "ArUco Homography Stabilizer — Video Mode\n";
+    std::cout << "Input  : " << video_path << "\n";
+    std::cout << "Frames : " << total_frames << " @ " << fps << " fps, "
+              << width << "x" << height << "\n\n";
+
+    cv::VideoWriter writer(
+        output_dir + "/stabilized.avi",
+        cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
+        fps, cv::Size(width, height));
+
+    int valid_homographies = 0, fallback_used = 0, all_anchors_detected = 0;
+    int frame_idx = 0;
+    cv::Mat frame;
+
+    while (cap.read(frame)) {
+        if (frame_idx % 100 == 0)
+            std::cout << "Frame " << frame_idx << "/" << total_frames << "\n";
+
+        HomographyStabilizer::Metrics m;
+        cv::Mat stabilized = stabilizer.stabilize(frame, m);
+        writer.write(stabilized);
+
+        if (m.homography_valid) valid_homographies++;
+        if (m.used_fallback) fallback_used++;
+        if (m.all_anchors_found) all_anchors_detected++;
+        frame_idx++;
+    }
+
+    cap.release();
+    writer.release();
+
+    std::cout << "\n=== Summary ===\n";
+    std::cout << "Frames processed: " << frame_idx << "\n";
+    std::cout << "All anchors detected: " << all_anchors_detected
+              << " (" << (100.0 * all_anchors_detected / frame_idx) << "%)\n";
+    std::cout << "Valid homographies: " << valid_homographies
+              << " (" << (100.0 * valid_homographies / frame_idx) << "%)\n";
+    std::cout << "Stabilized video → " << output_dir << "/stabilized.avi\n";
+}
+
+
+static bool isVideoFile(const std::string& path) {
+    std::string ext = fs::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext == ".mp4" || ext == ".avi" || ext == ".mov" || ext == ".mkv";
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input_dir> <output_dir>\n";
-        std::cerr << "  input_dir  : directory containing frames/ subfolder\n";
-        std::cerr << "  output_dir : stabilised frames written here\n";
+        std::cerr << "Usage: " << argv[0] << " <input> <output_dir>\n";
+        std::cerr << "  input : video file (.mp4/.avi/.mov) OR directory with frames/\n";
         return 1;
     }
 
     std::string in  = argv[1];
     std::string out = argv[2];
 
-    if (!fs::exists(in + "/frames")) {
-        std::cerr << "Frames directory not found: " << in << "/frames\n";
-        return 1;
+    if (isVideoFile(in)) {
+        if (!fs::exists(in)) {
+            std::cerr << "Video not found: " << in << "\n";
+            return 1;
+        }
+        processVideo(in, out);
+    } else {
+        if (!fs::exists(in + "/frames")) {
+            std::cerr << "Frames directory not found: " << in << "/frames\n";
+            return 1;
+        }
+        processDataset(in, out);
     }
 
-    processDataset(in, out);
     return 0;
 }

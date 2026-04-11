@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # Find required packages
 find_package(OpenCV REQUIRED)
 find_package(PkgConfig REQUIRED)
+find_package(CUDA QUIET)
 
 # Include directories
 include_directories(${OpenCV_INCLUDE_DIRS})

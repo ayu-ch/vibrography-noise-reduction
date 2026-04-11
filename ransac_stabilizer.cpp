@@ -1,9 +1,13 @@
 #include <opencv2/opencv.hpp>
 #include <opencv2/features2d.hpp>
 #include <opencv2/aruco.hpp>
+#include <opencv2/cudafeatures2d.hpp>
+#include <opencv2/cudawarping.hpp>
+#include <opencv2/cudaimgproc.hpp>
 #include <iostream>
 #include <vector>
 #include <string>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -20,18 +24,8 @@ using json = nlohmann::json;
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── Frame geometry ────────────────────────────────────────────────────────────
-static constexpr int FRAME_W = 1440;
-static constexpr int FRAME_H = 1080;
 static constexpr int ARUCO_SIZE = 150;
 static constexpr int EXCLUSION_MARGIN = 40;
-
-// ArUco exclusion region for ORB detection
-static const cv::Rect ARUCO_EXCLUSION(
-    FRAME_W / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
-    FRAME_H / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
-    ARUCO_SIZE + 2 * EXCLUSION_MARGIN,
-    ARUCO_SIZE + 2 * EXCLUSION_MARGIN
-);
 
 // ── Refined Parameters for Sub-pixel Accuracy ───────────────────────────────
 static constexpr int   ORB_FEATURES   = 5000;   // More features for stability
@@ -71,79 +65,96 @@ public:
     };
 
     RansacStabilizer()
-        : orb_(cv::ORB::create(ORB_FEATURES)),
-          aruco_dict_(cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250)),
-          aruco_params_(cv::aruco::DetectorParameters::create())
     {
-        // Configure ORB for better feature quality
-        orb_->setScaleFactor(1.2f);     // Smaller scale factor for more levels
-        orb_->setNLevels(12);           // More pyramid levels
-        orb_->setEdgeThreshold(15);     // Smaller edge threshold
-        orb_->setFirstLevel(0);         // Start from original resolution
-        orb_->setWTA_K(2);              // Use 2-point sampling
-        orb_->setScoreType(cv::ORB::HARRIS_SCORE);  // Better corner response
-        
-        // Configure ArUco detection for sub-pixel accuracy
-        aruco_params_->cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
-        aruco_params_->cornerRefinementWinSize = 5;
-        aruco_params_->cornerRefinementMaxIterations = 30;
-        aruco_params_->cornerRefinementMinAccuracy = 0.01;
-        
-        // Build feature mask - exclude ArUco region from ORB detection
-        feature_mask_ = cv::Mat::ones(FRAME_H, FRAME_W, CV_8U) * 255;
-        feature_mask_(ARUCO_EXCLUSION) = 0;
+        // ── CUDA ORB ──────────────────────────────────────────────────────
+        orb_gpu_ = cv::cuda::ORB::create(
+            ORB_FEATURES, 1.2f, 12, 15, 0, 2,
+            cv::ORB::HARRIS_SCORE, 31, 20, true);
+
+        // ── CUDA BF Matcher ───────────────────────────────────────────────
+        matcher_gpu_ = cv::cuda::DescriptorMatcher::createBFMatcher(cv::NORM_HAMMING);
+
+        // ── ArUco (stays on CPU — no CUDA version in OpenCV) ──────────────
+        aruco_dict_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
+        cv::aruco::DetectorParameters det_params;
+        det_params.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
+        det_params.cornerRefinementWinSize = 5;
+        det_params.cornerRefinementMaxIterations = 30;
+        det_params.cornerRefinementMinAccuracy = 0.01;
+        aruco_detector_ = cv::aruco::ArucoDetector(aruco_dict_, det_params);
+
+        // Mask built on first frame (size not known yet)
+        mask_built_ = false;
+    }
+
+    void buildMask(int width, int height) {
+        cv::Rect exclusion(
+            width / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
+            height / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
+            ARUCO_SIZE + 2 * EXCLUSION_MARGIN,
+            ARUCO_SIZE + 2 * EXCLUSION_MARGIN);
+        cv::Mat mask_cpu = cv::Mat::ones(height, width, CV_8U) * 255;
+        mask_cpu(exclusion) = 0;
+        mask_gpu_.upload(mask_cpu);
+        mask_built_ = true;
     }
 
     cv::Mat stabilize(const cv::Mat& frame, Metrics& m) {
         auto t_start = cv::getTickCount();
-        
-        cv::Mat gray;
-        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-        // ── 1. ORB feature detection and matching ────────────────────────
+        // Build mask on first frame (adapts to any resolution)
+        if (!mask_built_)
+            buildMask(frame.cols, frame.rows);
+
+        // ── 1. Upload to GPU and convert to gray ──────────────────────────
+        cv::cuda::GpuMat gpu_frame, gpu_gray;
+        gpu_frame.upload(frame);
+        cv::cuda::cvtColor(gpu_frame, gpu_gray, cv::COLOR_BGR2GRAY);
+
+        // ── 2. CUDA ORB detection ─────────────────────────────────────────
+        cv::cuda::GpuMat gpu_kps_mat, gpu_desc;
+        orb_gpu_->detectAndComputeAsync(gpu_gray, mask_gpu_,
+                                        gpu_kps_mat, gpu_desc, false, stream_);
+        stream_.waitForCompletion();
+
         std::vector<cv::KeyPoint> kps;
-        cv::Mat desc;
-        orb_->detectAndCompute(gray, feature_mask_, kps, desc);
+        orb_gpu_->convert(gpu_kps_mat, kps);
         m.keypoints_found = static_cast<int>(kps.size());
 
-        // Initialize reference frame
         if (!initialized_) {
-            if (kps.size() < MIN_MATCHES) {
+            if (static_cast<int>(kps.size()) < MIN_MATCHES)
                 return frame.clone();
-            }
             ref_kps_ = kps;
-            ref_desc_ = desc.clone();
+            ref_desc_gpu_ = gpu_desc.clone();
             initialized_ = true;
             return frame.clone();
         }
 
-        // ── 2. Match and estimate homography ──────────────────────────────
+        // ── 3. CUDA BF kNN matching ──────────────────────────────────────
         cv::Mat H;
-        if (kps.size() >= MIN_MATCHES) {
-            cv::BFMatcher matcher(cv::NORM_HAMMING);
+        if (static_cast<int>(kps.size()) >= MIN_MATCHES) {
             std::vector<std::vector<cv::DMatch>> knn_matches;
-            matcher.knnMatch(desc, ref_desc_, knn_matches, 2);
+            matcher_gpu_->knnMatch(gpu_desc, ref_desc_gpu_, knn_matches, 2);
 
-            // Lowe ratio test
             std::vector<cv::DMatch> good_matches;
             for (const auto& pair : knn_matches) {
-                if (pair.size() == 2 && pair[0].distance < LOWE_RATIO * pair[1].distance) {
+                if (pair.size() == 2 && pair[0].distance < LOWE_RATIO * pair[1].distance)
                     good_matches.push_back(pair[0]);
-                }
             }
             m.good_matches = static_cast<int>(good_matches.size());
 
-            if (good_matches.size() >= MIN_MATCHES) {
+            if (m.good_matches >= MIN_MATCHES) {
                 std::vector<cv::Point2f> src_pts, dst_pts;
                 for (const auto& dm : good_matches) {
                     src_pts.push_back(kps[dm.queryIdx].pt);
                     dst_pts.push_back(ref_kps_[dm.trainIdx].pt);
                 }
 
+                // findHomography stays on CPU (no useful GPU version)
                 std::vector<uchar> mask;
-                H = cv::findHomography(src_pts, dst_pts, cv::RANSAC, RANSAC_THRESH, mask, 
-                                     2000, HOMOGRAPHY_CONFIDENCE);
-                
+                H = cv::findHomography(src_pts, dst_pts, cv::RANSAC, RANSAC_THRESH, mask,
+                                       2000, HOMOGRAPHY_CONFIDENCE);
+
                 if (!H.empty()) {
                     m.inliers = cv::countNonZero(mask);
                     double inlier_ratio = static_cast<double>(m.inliers) /
@@ -152,14 +163,9 @@ public:
                                         inlier_ratio >= MIN_INLIER_RATIO;
                     if (m.homography_valid) {
                         last_valid_H_ = H.clone();
-                        // Adaptive reference refresh: if inliers are dropping, update
-                        // the reference to the current stabilized frame so that future
-                        // frames match against a more recent (and thus more similar)
-                        // scene view rather than drifting far from frame 0.
                         if (m.inliers < REFRESH_INLIER_THRESHOLD) {
-                            ref_kps_   = kps;
-                            ref_desc_  = desc.clone();
-                            // Reset last_valid_H_ so next frame computes fresh
+                            ref_kps_ = kps;
+                            ref_desc_gpu_ = gpu_desc.clone();
                             last_valid_H_ = cv::Mat();
                         }
                     }
@@ -167,25 +173,31 @@ public:
             }
         }
 
-        // ── 3. Apply stabilization with sub-pixel interpolation ──────────────
-        // Decompose the H that will actually be applied
+        // ── 4. Decompose H ────────────────────────────────────────────────
         {
             const cv::Mat& Huse = (m.homography_valid && !H.empty()) ? H : last_valid_H_;
             if (!Huse.empty()) {
                 m.tx           = Huse.at<double>(0, 2);
                 m.ty           = Huse.at<double>(1, 2);
-                m.scale        = std::sqrt(Huse.at<double>(0,0)*Huse.at<double>(0,0) + Huse.at<double>(1,0)*Huse.at<double>(1,0));
-                m.rotation_deg = std::atan2(Huse.at<double>(1,0), Huse.at<double>(0,0)) * 180.0 / CV_PI;
+                m.scale        = std::sqrt(Huse.at<double>(0,0)*Huse.at<double>(0,0) +
+                                           Huse.at<double>(1,0)*Huse.at<double>(1,0));
+                m.rotation_deg = std::atan2(Huse.at<double>(1,0),
+                                            Huse.at<double>(0,0)) * 180.0 / CV_PI;
             }
         }
 
+        // ── 5. CUDA warpPerspective ───────────────────────────────────────
         cv::Mat stabilized;
         if (m.homography_valid) {
-            cv::warpPerspective(frame, stabilized, H, frame.size(),
-                              cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+            cv::cuda::GpuMat gpu_stabilized;
+            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H, frame.size(),
+                                      cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+            gpu_stabilized.download(stabilized);
         } else if (!last_valid_H_.empty()) {
-            cv::warpPerspective(frame, stabilized, last_valid_H_, frame.size(),
-                              cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+            cv::cuda::GpuMat gpu_stabilized;
+            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, last_valid_H_, frame.size(),
+                                      cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+            gpu_stabilized.download(stabilized);
         } else {
             stabilized = frame.clone();
         }
@@ -199,7 +211,7 @@ public:
         
         std::vector<int> ids;
         std::vector<std::vector<cv::Point2f>> corners;
-        cv::aruco::detectMarkers(frame, aruco_dict_, corners, ids, aruco_params_);
+        aruco_detector_.detectMarkers(frame, corners, ids);
         
         cv::Point2f center(0, 0);
         m.aruco_detected = false;
@@ -236,9 +248,8 @@ public:
     void reset() {
         initialized_ = false;
         ref_kps_.clear();
-        ref_desc_ = cv::Mat();
+        ref_desc_gpu_ = cv::cuda::GpuMat();
         last_valid_H_ = cv::Mat();
-        reference_aruco_center_ = cv::Point2f(0, 0);
     }
 
 private:
@@ -246,16 +257,18 @@ private:
         return static_cast<double>(ticks) / cv::getTickFrequency() * 1000.0;
     }
 
-    cv::Ptr<cv::ORB> orb_;
-    cv::Ptr<cv::aruco::Dictionary> aruco_dict_;
-    cv::Ptr<cv::aruco::DetectorParameters> aruco_params_;
-    cv::Mat feature_mask_;
+    cv::Ptr<cv::cuda::ORB> orb_gpu_;
+    cv::Ptr<cv::cuda::DescriptorMatcher> matcher_gpu_;
+    cv::aruco::Dictionary aruco_dict_;
+    cv::aruco::ArucoDetector aruco_detector_;
+    cv::cuda::GpuMat mask_gpu_;
+    cv::cuda::Stream stream_;
 
     bool initialized_ = false;
+    bool mask_built_ = false;
     std::vector<cv::KeyPoint> ref_kps_;
-    cv::Mat ref_desc_;
+    cv::cuda::GpuMat ref_desc_gpu_;
     cv::Mat last_valid_H_;
-    cv::Point2f reference_aruco_center_;
 };
 
 
@@ -420,28 +433,112 @@ void processDataset(const std::string& input_dir, const std::string& output_dir)
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Video input mode
+// ─────────────────────────────────────────────────────────────────────────────
+
+void processVideo(const std::string& video_path, const std::string& output_dir) {
+    RansacStabilizer stabilizer;
+    fs::create_directories(output_dir);
+
+    cv::VideoCapture cap(video_path);
+    if (!cap.isOpened()) {
+        std::cerr << "Cannot open video: " << video_path << "\n";
+        return;
+    }
+
+    int total_frames = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
+    double fps       = cap.get(cv::CAP_PROP_FPS);
+    int width        = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height       = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+
+    std::cout << "RANSAC Stabilizer — Video Mode\n";
+    std::cout << "Input  : " << video_path << "\n";
+    std::cout << "Frames : " << total_frames << " @ " << fps << " fps, "
+              << width << "x" << height << "\n\n";
+
+    std::ofstream csv(output_dir + "/compensation.csv");
+    csv << "frame_id,tx_px,ty_px,rotation_deg,scale,"
+           "keypoints_found,good_matches,inliers,homography_valid,"
+           "aruco_detected,aruco_center_x,aruco_center_y\n";
+
+    cv::VideoWriter writer(
+        output_dir + "/stabilized.avi",
+        cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
+        fps, cv::Size(width, height));
+    if (!writer.isOpened()) {
+        std::cerr << "Warning: VideoWriter failed, trying raw AVI...\n";
+        writer.open(output_dir + "/stabilized.avi", 0, 30.0, cv::Size(width, height));
+    }
+    if (!writer.isOpened()) {
+        std::cerr << "Warning: Could not open VideoWriter. Frames will be saved as PNGs only.\n";
+    }
+
+    int frame_idx = 0;
+    cv::Mat frame;
+
+    while (cap.read(frame)) {
+        if (frame_idx % 100 == 0)
+            std::cout << "Frame " << frame_idx << "/" << total_frames << "\n";
+
+        RansacStabilizer::Metrics m;
+        cv::Mat stabilized = stabilizer.stabilize(frame, m);
+        if (writer.isOpened()) writer.write(stabilized);
+
+        cv::Point2f center = stabilizer.detectArUcoCenter(stabilized, m);
+
+        csv << frame_idx << ","
+            << m.tx << "," << m.ty << ","
+            << m.rotation_deg << "," << m.scale << ","
+            << m.keypoints_found << "," << m.good_matches << "," << m.inliers << ","
+            << m.homography_valid << ","
+            << m.aruco_detected << ","
+            << m.aruco_center.x << "," << m.aruco_center.y << "\n";
+
+        frame_idx++;
+    }
+
+    cap.release();
+    writer.release();
+    std::cout << "\nProcessed " << frame_idx << " frames\n";
+    std::cout << "Stabilized video → " << output_dir << "/stabilized.avi\n";
+}
+
+
+static bool isVideoFile(const std::string& path) {
+    std::string ext = fs::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+    return ext == ".mp4" || ext == ".avi" || ext == ".mov" || ext == ".mkv";
+}
+
 int main(int argc, char* argv[]) {
     if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input_dir> <output_dir>\n";
-        std::cerr << "  input_dir  : directory with frames/ and ground_truth.json\n";
-        std::cerr << "  output_dir : stabilized frames and displacement analysis\n";
+        std::cerr << "Usage: " << argv[0] << " <input> <output_dir>\n";
+        std::cerr << "  input : video file (.mp4/.avi/.mov) OR directory with frames/\n";
         return 1;
     }
-    
-    std::string input_dir = argv[1];
+
+    std::string input = argv[1];
     std::string output_dir = argv[2];
-    
-    if (!fs::exists(input_dir + "/frames")) {
-        std::cerr << "Frames directory not found: " << input_dir << "/frames\n";
-        return 1;
-    }
-    
+
     try {
-        processDataset(input_dir, output_dir);
+        if (isVideoFile(input)) {
+            if (!fs::exists(input)) {
+                std::cerr << "Video not found: " << input << "\n";
+                return 1;
+            }
+            processVideo(input, output_dir);
+        } else {
+            if (!fs::exists(input + "/frames")) {
+                std::cerr << "Frames directory not found: " << input << "/frames\n";
+                return 1;
+            }
+            processDataset(input, output_dir);
+        }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;
     }
-    
+
     return 0;
 }
