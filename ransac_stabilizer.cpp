@@ -30,7 +30,7 @@ static constexpr int EXCLUSION_MARGIN = 40;
 // ── Refined Parameters for Sub-pixel Accuracy ───────────────────────────────
 static constexpr int   ORB_FEATURES   = 5000;   // More features for stability
 static constexpr float LOWE_RATIO     = 0.65f;  // Tighter ratio test (was 0.7)
-static constexpr double RANSAC_THRESH = 1.0;    // Tighter RANSAC threshold
+static constexpr double RANSAC_THRESH = 3.0;    // Wider threshold for larger displacement
 static constexpr int   MIN_MATCHES    = 25;     // More matches required
 static constexpr double HOMOGRAPHY_CONFIDENCE = 0.995;  // Higher confidence
 // Reference refresh: update reference when inlier ratio drops below this
@@ -163,11 +163,8 @@ public:
                                         inlier_ratio >= MIN_INLIER_RATIO;
                     if (m.homography_valid) {
                         last_valid_H_ = H.clone();
-                        if (m.inliers < REFRESH_INLIER_THRESHOLD) {
-                            ref_kps_ = kps;
-                            ref_desc_gpu_ = gpu_desc.clone();
-                            last_valid_H_ = cv::Mat();
-                        }
+                        // No reference refresh — always match against frame 0.
+                        // This avoids rubber-banding artifacts from reference snaps.
                     }
                 }
             }
@@ -477,9 +474,10 @@ void processVideo(const std::string& video_path, const std::string& output_dir) 
     int frame_idx = 0;
     cv::Mat frame;
 
-    while (cap.read(frame)) {
+    const int MAX_FRAMES = 500;  // testing: process only first N frames
+    while (cap.read(frame) && frame_idx < MAX_FRAMES) {
         if (frame_idx % 100 == 0)
-            std::cout << "Frame " << frame_idx << "/" << total_frames << "\n";
+            std::cout << "Frame " << frame_idx << "/" << std::min(total_frames, MAX_FRAMES) << "\n";
 
         RansacStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);

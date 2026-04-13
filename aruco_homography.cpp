@@ -268,9 +268,10 @@ void processVideo(const std::string& video_path, const std::string& output_dir) 
     int frame_idx = 0;
     cv::Mat frame;
 
-    while (cap.read(frame)) {
+    const int MAX_FRAMES = 500;
+    while (cap.read(frame) && frame_idx < MAX_FRAMES) {
         if (frame_idx % 100 == 0)
-            std::cout << "Frame " << frame_idx << "/" << total_frames << "\n";
+            std::cout << "Frame " << frame_idx << "/" << std::min(total_frames, MAX_FRAMES) << "\n";
 
         HomographyStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
