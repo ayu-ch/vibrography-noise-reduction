@@ -170,29 +170,48 @@ public:
             }
         }
 
-        // ── 4. Decompose H ────────────────────────────────────────────────
+        // ── 4. Decompose H and apply temporal smoothing ──────────────────
         {
             const cv::Mat& Huse = (m.homography_valid && !H.empty()) ? H : last_valid_H_;
             if (!Huse.empty()) {
-                m.tx           = Huse.at<double>(0, 2);
-                m.ty           = Huse.at<double>(1, 2);
-                m.scale        = std::sqrt(Huse.at<double>(0,0)*Huse.at<double>(0,0) +
-                                           Huse.at<double>(1,0)*Huse.at<double>(1,0));
-                m.rotation_deg = std::atan2(Huse.at<double>(1,0),
-                                            Huse.at<double>(0,0)) * 180.0 / CV_PI;
+                double raw_tx    = Huse.at<double>(0, 2);
+                double raw_ty    = Huse.at<double>(1, 2);
+                double raw_scale = std::sqrt(Huse.at<double>(0,0)*Huse.at<double>(0,0) +
+                                             Huse.at<double>(1,0)*Huse.at<double>(1,0));
+                double raw_rot   = std::atan2(Huse.at<double>(1,0),
+                                              Huse.at<double>(0,0)) * 180.0 / CV_PI;
+
+                // Exponential moving average: smooth_val = alpha * raw + (1-alpha) * prev
+                // alpha = 0.3 → responsive but eliminates frame-to-frame jitter
+                constexpr double ALPHA = 0.3;
+                smooth_tx_    = ALPHA * raw_tx    + (1.0 - ALPHA) * smooth_tx_;
+                smooth_ty_    = ALPHA * raw_ty    + (1.0 - ALPHA) * smooth_ty_;
+                smooth_rot_   = ALPHA * raw_rot   + (1.0 - ALPHA) * smooth_rot_;
+                smooth_scale_ = ALPHA * raw_scale + (1.0 - ALPHA) * smooth_scale_;
+
+                m.tx           = smooth_tx_;
+                m.ty           = smooth_ty_;
+                m.rotation_deg = smooth_rot_;
+                m.scale        = smooth_scale_;
             }
         }
 
-        // ── 5. CUDA warpPerspective ───────────────────────────────────────
+        // ── 5. Reconstruct smoothed H and CUDA warpPerspective ───────────
         cv::Mat stabilized;
-        if (m.homography_valid) {
+        if (m.tx != 0.0 || m.ty != 0.0 || m.rotation_deg != 0.0 || m.scale != 1.0) {
+            double theta_rad = m.rotation_deg * CV_PI / 180.0;
+            double cos_t = m.scale * std::cos(theta_rad);
+            double sin_t = m.scale * std::sin(theta_rad);
+            cv::Mat H_smooth = cv::Mat::eye(3, 3, CV_64F);
+            H_smooth.at<double>(0, 0) =  cos_t;
+            H_smooth.at<double>(0, 1) = -sin_t;
+            H_smooth.at<double>(0, 2) =  m.tx;
+            H_smooth.at<double>(1, 0) =  sin_t;
+            H_smooth.at<double>(1, 1) =  cos_t;
+            H_smooth.at<double>(1, 2) =  m.ty;
+
             cv::cuda::GpuMat gpu_stabilized;
-            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H, frame.size(),
-                                      cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
-            gpu_stabilized.download(stabilized);
-        } else if (!last_valid_H_.empty()) {
-            cv::cuda::GpuMat gpu_stabilized;
-            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, last_valid_H_, frame.size(),
+            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H_smooth, frame.size(),
                                       cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
             gpu_stabilized.download(stabilized);
         } else {
@@ -263,6 +282,9 @@ private:
 
     bool initialized_ = false;
     bool mask_built_ = false;
+    // Temporal smoothing state (exponential moving average)
+    double smooth_tx_ = 0.0, smooth_ty_ = 0.0;
+    double smooth_rot_ = 0.0, smooth_scale_ = 1.0;
     std::vector<cv::KeyPoint> ref_kps_;
     cv::cuda::GpuMat ref_desc_gpu_;
     cv::Mat last_valid_H_;
