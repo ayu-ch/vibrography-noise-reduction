@@ -181,9 +181,9 @@ public:
                 double raw_rot   = std::atan2(Huse.at<double>(1,0),
                                               Huse.at<double>(0,0)) * 180.0 / CV_PI;
 
-                // Exponential moving average: smooth_val = alpha * raw + (1-alpha) * prev
-                // alpha = 0.3 → responsive but eliminates frame-to-frame jitter
-                constexpr double ALPHA = 0.3;
+                // Exponential moving average to suppress jitter
+                // alpha = 0.15 → strong smoothing (~7 frame window)
+                constexpr double ALPHA = 0.15;
                 smooth_tx_    = ALPHA * raw_tx    + (1.0 - ALPHA) * smooth_tx_;
                 smooth_ty_    = ALPHA * raw_ty    + (1.0 - ALPHA) * smooth_ty_;
                 smooth_rot_   = ALPHA * raw_rot   + (1.0 - ALPHA) * smooth_rot_;
@@ -456,7 +456,7 @@ void processDataset(const std::string& input_dir, const std::string& output_dir)
 //  Video input mode
 // ─────────────────────────────────────────────────────────────────────────────
 
-void processVideo(const std::string& video_path, const std::string& output_dir) {
+void processVideo(const std::string& video_path, const std::string& output_dir, int max_frames = 0) {
     RansacStabilizer stabilizer;
     fs::create_directories(output_dir);
 
@@ -496,10 +496,10 @@ void processVideo(const std::string& video_path, const std::string& output_dir) 
     int frame_idx = 0;
     cv::Mat frame;
 
-    const int MAX_FRAMES = 500;  // testing: process only first N frames
-    while (cap.read(frame) && frame_idx < MAX_FRAMES) {
+    int limit = (max_frames > 0) ? max_frames : total_frames;
+    while (cap.read(frame) && frame_idx < limit) {
         if (frame_idx % 100 == 0)
-            std::cout << "Frame " << frame_idx << "/" << std::min(total_frames, MAX_FRAMES) << "\n";
+            std::cout << "Frame " << frame_idx << "/" << limit << "\n";
 
         RansacStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
@@ -532,14 +532,21 @@ static bool isVideoFile(const std::string& path) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input> <output_dir>\n";
-        std::cerr << "  input : video file (.mp4/.avi/.mov) OR directory with frames/\n";
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <input> <output_dir> [--frames N]\n";
+        std::cerr << "  input     : video file (.mp4/.avi/.mov) OR directory with frames/\n";
+        std::cerr << "  --frames N: process only first N frames (default: all)\n";
         return 1;
     }
 
     std::string input = argv[1];
     std::string output_dir = argv[2];
+
+    int max_frames = 0;
+    for (int i = 3; i < argc - 1; i++) {
+        if (std::string(argv[i]) == "--frames")
+            max_frames = std::stoi(argv[i + 1]);
+    }
 
     try {
         if (isVideoFile(input)) {
@@ -547,7 +554,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Video not found: " << input << "\n";
                 return 1;
             }
-            processVideo(input, output_dir);
+            processVideo(input, output_dir, max_frames);
         } else {
             if (!fs::exists(input + "/frames")) {
                 std::cerr << "Frames directory not found: " << input << "/frames\n";

@@ -239,7 +239,7 @@ void processDataset(const std::string& input_dir, const std::string& output_dir)
 //  Video input mode
 // ─────────────────────────────────────────────────────────────────────────────
 
-void processVideo(const std::string& video_path, const std::string& output_dir) {
+void processVideo(const std::string& video_path, const std::string& output_dir, int max_frames = 0) {
     HomographyStabilizer stabilizer;
     fs::create_directories(output_dir);
 
@@ -268,10 +268,10 @@ void processVideo(const std::string& video_path, const std::string& output_dir) 
     int frame_idx = 0;
     cv::Mat frame;
 
-    const int MAX_FRAMES = 500;
-    while (cap.read(frame) && frame_idx < MAX_FRAMES) {
+    int limit = (max_frames > 0) ? max_frames : total_frames;
+    while (cap.read(frame) && frame_idx < limit) {
         if (frame_idx % 100 == 0)
-            std::cout << "Frame " << frame_idx << "/" << std::min(total_frames, MAX_FRAMES) << "\n";
+            std::cout << "Frame " << frame_idx << "/" << limit << "\n";
 
         HomographyStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
@@ -303,21 +303,28 @@ static bool isVideoFile(const std::string& path) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cerr << "Usage: " << argv[0] << " <input> <output_dir>\n";
-        std::cerr << "  input : video file (.mp4/.avi/.mov) OR directory with frames/\n";
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <input> <output_dir> [--frames N]\n";
+        std::cerr << "  input     : video file (.mp4/.avi/.mov) OR directory with frames/\n";
+        std::cerr << "  --frames N: process only first N frames (default: all)\n";
         return 1;
     }
 
     std::string in  = argv[1];
     std::string out = argv[2];
 
+    int max_frames = 0;
+    for (int i = 3; i < argc - 1; i++) {
+        if (std::string(argv[i]) == "--frames")
+            max_frames = std::stoi(argv[i + 1]);
+    }
+
     if (isVideoFile(in)) {
         if (!fs::exists(in)) {
             std::cerr << "Video not found: " << in << "\n";
             return 1;
         }
-        processVideo(in, out);
+        processVideo(in, out, max_frames);
     } else {
         if (!fs::exists(in + "/frames")) {
             std::cerr << "Frames directory not found: " << in << "/frames\n";
