@@ -35,7 +35,8 @@ static constexpr int   MIN_MATCHES    = 25;     // More matches required
 static constexpr double HOMOGRAPHY_CONFIDENCE = 0.995;  // Higher confidence
 // Reference refresh: update reference when inlier ratio drops below this
 // to prevent match degradation as the scene drifts from frame 0.
-static constexpr double MIN_INLIER_RATIO = 0.10; // 10% of good matches must be inliers
+static constexpr double MIN_INLIER_RATIO = 0.10;
+static constexpr int    KEYFRAME_INTERVAL = 100;  // refresh keyframe every N frames // 10% of good matches must be inliers
 static constexpr int    REFRESH_INLIER_THRESHOLD = 60; // refresh if inliers < this
 
 
@@ -124,17 +125,23 @@ public:
         if (!initialized_) {
             if (static_cast<int>(kps.size()) < MIN_MATCHES)
                 return frame.clone();
-            ref_kps_ = kps;
-            ref_desc_gpu_ = gpu_desc.clone();
+            keyframe_kps_ = kps;
+            keyframe_desc_gpu_ = gpu_desc.clone();
+            H_accumulated_ = cv::Mat::eye(3, 3, CV_64F);
+            frames_since_keyframe_ = 0;
             initialized_ = true;
             return frame.clone();
         }
 
-        // ── 3. CUDA BF kNN matching ──────────────────────────────────────
-        cv::Mat H;
+        frames_since_keyframe_++;
+
+        // ── 3. Match against keyframe ─────────────────────────────────────
+        // H_to_kf: current frame → keyframe (high inliers, keyframe is recent)
+        // H_total = H_accumulated_ * H_to_kf: current → frame 0
+        cv::Mat H_to_kf;
         if (static_cast<int>(kps.size()) >= MIN_MATCHES) {
             std::vector<std::vector<cv::DMatch>> knn_matches;
-            matcher_gpu_->knnMatch(gpu_desc, ref_desc_gpu_, knn_matches, 2);
+            matcher_gpu_->knnMatch(gpu_desc, keyframe_desc_gpu_, knn_matches, 2);
 
             std::vector<cv::DMatch> good_matches;
             for (const auto& pair : knn_matches) {
@@ -147,71 +154,54 @@ public:
                 std::vector<cv::Point2f> src_pts, dst_pts;
                 for (const auto& dm : good_matches) {
                     src_pts.push_back(kps[dm.queryIdx].pt);
-                    dst_pts.push_back(ref_kps_[dm.trainIdx].pt);
+                    dst_pts.push_back(keyframe_kps_[dm.trainIdx].pt);
                 }
 
-                // findHomography stays on CPU (no useful GPU version)
                 std::vector<uchar> mask;
-                H = cv::findHomography(src_pts, dst_pts, cv::RANSAC, RANSAC_THRESH, mask,
-                                       2000, HOMOGRAPHY_CONFIDENCE);
+                H_to_kf = cv::findHomography(src_pts, dst_pts, cv::RANSAC, RANSAC_THRESH, mask,
+                                              2000, HOMOGRAPHY_CONFIDENCE);
 
-                if (!H.empty()) {
+                if (!H_to_kf.empty()) {
                     m.inliers = cv::countNonZero(mask);
                     double inlier_ratio = static_cast<double>(m.inliers) /
-                                         static_cast<double>(good_matches.size());
+                                         static_cast<double>(m.good_matches);
                     m.homography_valid = m.inliers >= MIN_MATCHES &&
                                         inlier_ratio >= MIN_INLIER_RATIO;
-                    if (m.homography_valid) {
-                        last_valid_H_ = H.clone();
-                        // No reference refresh — always match against frame 0.
-                        // This avoids rubber-banding artifacts from reference snaps.
-                    }
                 }
             }
         }
 
-        // ── 4. Decompose H and apply temporal smoothing ──────────────────
-        {
-            const cv::Mat& Huse = (m.homography_valid && !H.empty()) ? H : last_valid_H_;
-            if (!Huse.empty()) {
-                double raw_tx    = Huse.at<double>(0, 2);
-                double raw_ty    = Huse.at<double>(1, 2);
-                double raw_scale = std::sqrt(Huse.at<double>(0,0)*Huse.at<double>(0,0) +
-                                             Huse.at<double>(1,0)*Huse.at<double>(1,0));
-                double raw_rot   = std::atan2(Huse.at<double>(1,0),
-                                              Huse.at<double>(0,0)) * 180.0 / CV_PI;
+        // ── 4. Compute total H and refresh keyframe if needed ─────────────
+        cv::Mat H_total;
+        if (m.homography_valid) {
+            H_total = H_accumulated_ * H_to_kf;
+            last_valid_H_ = H_total.clone();
 
-                // Exponential moving average to suppress jitter
-                // alpha = 0.15 → strong smoothing (~7 frame window)
-                constexpr double ALPHA = 0.15;
-                smooth_tx_    = ALPHA * raw_tx    + (1.0 - ALPHA) * smooth_tx_;
-                smooth_ty_    = ALPHA * raw_ty    + (1.0 - ALPHA) * smooth_ty_;
-                smooth_rot_   = ALPHA * raw_rot   + (1.0 - ALPHA) * smooth_rot_;
-                smooth_scale_ = ALPHA * raw_scale + (1.0 - ALPHA) * smooth_scale_;
-
-                m.tx           = smooth_tx_;
-                m.ty           = smooth_ty_;
-                m.rotation_deg = smooth_rot_;
-                m.scale        = smooth_scale_;
+            // Refresh keyframe every KEYFRAME_INTERVAL frames
+            if (frames_since_keyframe_ >= KEYFRAME_INTERVAL) {
+                H_accumulated_ = H_total.clone();
+                keyframe_kps_ = kps;
+                keyframe_desc_gpu_ = gpu_desc.clone();
+                frames_since_keyframe_ = 0;
             }
+        } else {
+            H_total = last_valid_H_;
         }
 
-        // ── 5. Reconstruct smoothed H and CUDA warpPerspective ───────────
-        cv::Mat stabilized;
-        if (m.tx != 0.0 || m.ty != 0.0 || m.rotation_deg != 0.0 || m.scale != 1.0) {
-            double theta_rad = m.rotation_deg * CV_PI / 180.0;
-            double cos_t = m.scale * std::cos(theta_rad);
-            double sin_t = m.scale * std::sin(theta_rad);
-            cv::Mat H_smooth = cv::Mat::eye(3, 3, CV_64F);
-            H_smooth.at<double>(0, 0) =  cos_t;
-            H_smooth.at<double>(0, 1) = -sin_t;
-            H_smooth.at<double>(0, 2) =  m.tx;
-            H_smooth.at<double>(1, 0) =  sin_t;
-            H_smooth.at<double>(1, 1) =  cos_t;
-            H_smooth.at<double>(1, 2) =  m.ty;
+        // ── 5. Decompose and apply H ──────────────────────────────────────
+        if (!H_total.empty()) {
+            m.tx           = H_total.at<double>(0, 2);
+            m.ty           = H_total.at<double>(1, 2);
+            m.scale        = std::sqrt(H_total.at<double>(0,0)*H_total.at<double>(0,0) +
+                                       H_total.at<double>(1,0)*H_total.at<double>(1,0));
+            m.rotation_deg = std::atan2(H_total.at<double>(1,0),
+                                        H_total.at<double>(0,0)) * 180.0 / CV_PI;
+        }
 
+        cv::Mat stabilized;
+        if (!H_total.empty()) {
             cv::cuda::GpuMat gpu_stabilized;
-            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H_smooth, frame.size(),
+            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H_total, frame.size(),
                                       cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
             gpu_stabilized.download(stabilized);
         } else {
@@ -263,8 +253,8 @@ public:
 
     void reset() {
         initialized_ = false;
-        ref_kps_.clear();
-        ref_desc_gpu_ = cv::cuda::GpuMat();
+        keyframe_kps_.clear();
+        keyframe_desc_gpu_ = cv::cuda::GpuMat();
         last_valid_H_ = cv::Mat();
     }
 
@@ -282,12 +272,11 @@ private:
 
     bool initialized_ = false;
     bool mask_built_ = false;
-    // Temporal smoothing state (exponential moving average)
-    double smooth_tx_ = 0.0, smooth_ty_ = 0.0;
-    double smooth_rot_ = 0.0, smooth_scale_ = 1.0;
-    std::vector<cv::KeyPoint> ref_kps_;
-    cv::cuda::GpuMat ref_desc_gpu_;
-    cv::Mat last_valid_H_;
+    int frames_since_keyframe_ = 0;
+    std::vector<cv::KeyPoint> keyframe_kps_;
+    cv::cuda::GpuMat keyframe_desc_gpu_;
+    cv::Mat H_accumulated_;       // keyframe → frame 0
+    cv::Mat last_valid_H_;        // last good total H (fallback)
 };
 
 
