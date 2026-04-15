@@ -198,14 +198,61 @@ public:
                                         H_total.at<double>(0,0)) * 180.0 / CV_PI;
         }
 
+        // ── 6. RANSAC warp ─────────────────────────────────────────────────
         cv::Mat stabilized;
+        cv::cuda::GpuMat gpu_stabilized;
         if (!H_total.empty()) {
-            cv::cuda::GpuMat gpu_stabilized;
             cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H_total, frame.size(),
                                       cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
             gpu_stabilized.download(stabilized);
         } else {
             stabilized = frame.clone();
+        }
+
+        // ── 7. ArUco feedback correction ──────────────────────────────────
+        // Detect centre marker (ID 0) in RANSAC-stabilized frame.
+        // If the marker has drifted from the reference position, apply a
+        // small translational correction to push it back.
+        // This closes the loop: RANSAC handles large motion (~50px),
+        // ArUco feedback corrects the remaining sub-pixel residual.
+        {
+            Metrics aruco_m;
+            cv::Point2f center = detectArUcoCenter(stabilized, aruco_m);
+            m.aruco_detected = aruco_m.aruco_detected;
+            m.aruco_center   = aruco_m.aruco_center;
+
+            if (aruco_m.aruco_detected) {
+                if (!aruco_ref_set_) {
+                    aruco_ref_center_ = center;
+                    aruco_ref_set_ = true;
+                } else {
+                    // Residual = how far the marker drifted from reference
+                    double residual_x = center.x - aruco_ref_center_.x;
+                    double residual_y = center.y - aruco_ref_center_.y;
+
+                    // Only correct if residual is meaningful (> noise floor)
+                    if (std::abs(residual_x) > 0.1 || std::abs(residual_y) > 0.1) {
+                        // Translational correction to cancel drift
+                        cv::Mat H_correction = cv::Mat::eye(3, 3, CV_64F);
+                        H_correction.at<double>(0, 2) = -residual_x;
+                        H_correction.at<double>(1, 2) = -residual_y;
+
+                        cv::cuda::GpuMat gpu_corrected;
+                        gpu_stabilized.upload(stabilized);
+                        cv::cuda::warpPerspective(gpu_stabilized, gpu_corrected,
+                                                  H_correction, frame.size(),
+                                                  cv::INTER_CUBIC, cv::BORDER_CONSTANT,
+                                                  cv::Scalar(0,0,0));
+                        gpu_corrected.download(stabilized);
+
+                        // Update metrics to reflect final corrected position
+                        m.tx += -residual_x;
+                        m.ty += -residual_y;
+                        m.aruco_center.x -= residual_x;
+                        m.aruco_center.y -= residual_y;
+                    }
+                }
+            }
         }
 
         m.stabilization_ms = tickMs(cv::getTickCount() - t_start);
@@ -277,6 +324,9 @@ private:
     cv::cuda::GpuMat keyframe_desc_gpu_;
     cv::Mat H_accumulated_;       // keyframe → frame 0
     cv::Mat last_valid_H_;        // last good total H (fallback)
+    // ArUco feedback loop state
+    cv::Point2f aruco_ref_center_;
+    bool aruco_ref_set_ = false;
 };
 
 
