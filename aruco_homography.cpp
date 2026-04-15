@@ -6,6 +6,8 @@
 #include <string>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <cmath>
 #include <map>
 #include <set>
 
@@ -25,17 +27,37 @@ public:
         bool homography_valid = false;
         bool used_fallback = false;
         double reprojection_error_px = 0.0;
+        // Decomposed compensation
+        double tx = 0.0;
+        double ty = 0.0;
+        double rotation_deg = 0.0;
+        double scale = 1.0;
+        // Centre marker (ID 0) tracking in stabilized frame
+        bool aruco_detected = false;
+        cv::Point2f aruco_center = cv::Point2f(0, 0);
     };
 
     HomographyStabilizer() {
         aruco_dict_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_6X6_250);
 
-        det_params_.adaptiveThreshWinSizeMin = 5;
-        det_params_.adaptiveThreshWinSizeMax = 23;
-        det_params_.minMarkerPerimeterRate = 0.02;
+        det_params_.adaptiveThreshWinSizeMin = 3;
+        det_params_.adaptiveThreshWinSizeMax = 53;
+        det_params_.adaptiveThreshWinSizeStep = 4;
+        det_params_.adaptiveThreshConstant = 7;
+        det_params_.minMarkerPerimeterRate = 0.01;
         det_params_.maxMarkerPerimeterRate = 4.0;
+        det_params_.polygonalApproxAccuracyRate = 0.05;
+        det_params_.minCornerDistanceRate = 0.02;
+        det_params_.minDistanceToBorder = 1;
+        det_params_.minOtsuStdDev = 3.0;
+        det_params_.perspectiveRemovePixelPerCell = 8;
+        det_params_.perspectiveRemoveIgnoredMarginPerCell = 0.2;
+        det_params_.maxErroneousBitsInBorderRate = 0.5;
+        det_params_.errorCorrectionRate = 0.8;
         det_params_.cornerRefinementMethod = cv::aruco::CORNER_REFINE_SUBPIX;
         det_params_.cornerRefinementWinSize = 5;
+        det_params_.cornerRefinementMaxIterations = 50;
+        det_params_.cornerRefinementMinAccuracy = 0.01;
 
         detector_ = cv::aruco::ArucoDetector(aruco_dict_, det_params_);
     }
@@ -71,6 +93,14 @@ public:
             m.used_fallback = true;
         }
 
+        // Decompose H
+        m.tx           = H.at<double>(0, 2);
+        m.ty           = H.at<double>(1, 2);
+        m.scale        = std::sqrt(H.at<double>(0,0)*H.at<double>(0,0) +
+                                   H.at<double>(1,0)*H.at<double>(1,0));
+        m.rotation_deg = std::atan2(H.at<double>(1,0),
+                                    H.at<double>(0,0)) * 180.0 / CV_PI;
+
         // Apply stabilization (GPU)
         cv::Mat stabilized;
         cv::cuda::GpuMat gpu_frame, gpu_stabilized;
@@ -78,8 +108,28 @@ public:
         cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H, frame.size(),
                                   cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         gpu_stabilized.download(stabilized);
-        
+
         return stabilized;
+    }
+
+    cv::Point2f detectCenterMarker(const cv::Mat& frame, Metrics& m) {
+        std::vector<int> ids;
+        std::vector<std::vector<cv::Point2f>> corners;
+        detector_.detectMarkers(frame, corners, ids);
+
+        cv::Point2f center(0, 0);
+        m.aruco_detected = false;
+
+        for (size_t i = 0; i < ids.size(); ++i) {
+            if (ids[i] == MEASUREMENT_ID) {
+                for (const auto& c : corners[i]) center += c;
+                center /= 4.0f;
+                m.aruco_detected = true;
+                m.aruco_center = center;
+                break;
+            }
+        }
+        return center;
     }
 
     void reset() {
@@ -259,6 +309,11 @@ void processVideo(const std::string& video_path, const std::string& output_dir, 
     std::cout << "Frames : " << total_frames << " @ " << fps << " fps, "
               << width << "x" << height << "\n\n";
 
+    std::ofstream csv(output_dir + "/compensation.csv");
+    csv << "frame_id,tx_px,ty_px,rotation_deg,scale,"
+           "anchor_markers_found,all_anchors_found,homography_valid,used_fallback,"
+           "reprojection_error_px,aruco_detected,aruco_center_x,aruco_center_y\n";
+
     cv::VideoWriter writer(
         output_dir + "/stabilized.avi",
         cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
@@ -277,6 +332,18 @@ void processVideo(const std::string& video_path, const std::string& output_dir, 
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
         writer.write(stabilized);
 
+        // Detect centre marker in stabilized frame
+        stabilizer.detectCenterMarker(stabilized, m);
+
+        csv << frame_idx << ","
+            << m.tx << "," << m.ty << ","
+            << m.rotation_deg << "," << m.scale << ","
+            << m.anchor_markers_found << "," << m.all_anchors_found << ","
+            << m.homography_valid << "," << m.used_fallback << ","
+            << m.reprojection_error_px << ","
+            << m.aruco_detected << ","
+            << m.aruco_center.x << "," << m.aruco_center.y << "\n";
+
         if (m.homography_valid) valid_homographies++;
         if (m.used_fallback) fallback_used++;
         if (m.all_anchors_found) all_anchors_detected++;
@@ -293,6 +360,7 @@ void processVideo(const std::string& video_path, const std::string& output_dir, 
     std::cout << "Valid homographies: " << valid_homographies
               << " (" << (100.0 * valid_homographies / frame_idx) << "%)\n";
     std::cout << "Stabilized video → " << output_dir << "/stabilized.avi\n";
+    std::cout << "Compensation CSV  → " << output_dir << "/compensation.csv\n";
 }
 
 
