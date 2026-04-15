@@ -157,16 +157,30 @@ public:
                     dst_pts.push_back(keyframe_kps_[dm.trainIdx].pt);
                 }
 
-                std::vector<uchar> mask;
-                H_to_kf = cv::findHomography(src_pts, dst_pts, cv::RANSAC, RANSAC_THRESH, mask,
-                                              2000, HOMOGRAPHY_CONFIDENCE);
-
-                if (!H_to_kf.empty()) {
-                    m.inliers = cv::countNonZero(mask);
+                // Use affine (4-DOF: tx, ty, rotation, scale) instead of
+                // full homography (8-DOF). The perspective terms in a full H
+                // are pure noise for a flat scene, and they cause the bottom
+                // of the frame to vibrate differently from the top.
+                cv::Mat inlier_mask;
+                cv::Mat A = cv::estimateAffinePartial2D(src_pts, dst_pts, inlier_mask,
+                                                        cv::RANSAC, RANSAC_THRESH,
+                                                        2000, HOMOGRAPHY_CONFIDENCE);
+                if (!A.empty()) {
+                    m.inliers = cv::countNonZero(inlier_mask);
                     double inlier_ratio = static_cast<double>(m.inliers) /
                                          static_cast<double>(m.good_matches);
                     m.homography_valid = m.inliers >= MIN_MATCHES &&
                                         inlier_ratio >= MIN_INLIER_RATIO;
+                    if (m.homography_valid) {
+                        // Convert 2x3 affine to 3x3 homography for warpPerspective
+                        H_to_kf = cv::Mat::eye(3, 3, CV_64F);
+                        H_to_kf.at<double>(0, 0) = A.at<double>(0, 0);
+                        H_to_kf.at<double>(0, 1) = A.at<double>(0, 1);
+                        H_to_kf.at<double>(0, 2) = A.at<double>(0, 2);
+                        H_to_kf.at<double>(1, 0) = A.at<double>(1, 0);
+                        H_to_kf.at<double>(1, 1) = A.at<double>(1, 1);
+                        H_to_kf.at<double>(1, 2) = A.at<double>(1, 2);
+                    }
                 }
             }
         }
