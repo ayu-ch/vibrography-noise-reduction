@@ -88,13 +88,7 @@ public:
     }
 
     void buildMask(int width, int height) {
-        cv::Rect exclusion(
-            width / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
-            height / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
-            ARUCO_SIZE + 2 * EXCLUSION_MARGIN,
-            ARUCO_SIZE + 2 * EXCLUSION_MARGIN);
         cv::Mat mask_cpu = cv::Mat::ones(height, width, CV_8U) * 255;
-        mask_cpu(exclusion) = 0;
         mask_gpu_.upload(mask_cpu);
         mask_built_ = true;
     }
