@@ -41,27 +41,27 @@ class StabilizerEnv(gym.Env):
         self.observation_space = spaces.Box(
             -np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
 
-        # Action scaling bounds
-        self.tx_max = 25.0
-        self.ty_max = 25.0
-        self.theta_max = 0.6
-        self.scale_half = 0.02
+        # Action scaling bounds (matched to real video: 48px X, 5px Y sway)
+        self.tx_max = 50.0
+        self.ty_max = 10.0
+        self.theta_max = 0.05
+        self.scale_half = 0.002
 
         # Normalization
-        self.norm_t = 25.0
-        self.norm_r = 0.6
-        self.inlier_saturate = 400
+        self.norm_t = 50.0
+        self.norm_r = 0.05
+        self.inlier_saturate = 4000
 
         # Reward weights
         self.rotation_weight = 100.0
         self.smoothness_weight = 0.1
         self.scale_weight = 1000.0
 
-        # RANSAC simulation defaults (overridden by domain randomization)
-        self.ransac_noise_sigma = 1.5
-        self.ransac_inlier_mean = 300
-        self.ransac_inlier_std = 80
-        self.dropout_rate = 0.05
+        # RANSAC simulation defaults (from real video analysis)
+        self.ransac_noise_sigma = 1.14
+        self.ransac_inlier_mean = 2480
+        self.ransac_inlier_std = 519
+        self.dropout_rate = 0.002
 
         self._rng = np.random.default_rng(seed)
 
@@ -82,22 +82,34 @@ class StabilizerEnv(gym.Env):
     # ── RANSAC simulation ─────────────────────────────────────────────────────
 
     def _simulate_ransac(self, gt_tx, gt_ty, gt_theta):
-        """Simulate noisy RANSAC measurement from ground truth."""
+        """Simulate noisy RANSAC measurement from ground truth.
+
+        Noise model calibrated from real video analysis:
+        - tx noise: light-tailed (kurtosis -0.95), use uniform-ish noise
+        - ty noise: heavy-tailed (kurtosis 1.81), use t-distribution
+        - Jitter NOT proportional to inliers (real data shows mid-range
+          inliers have MORE jitter from keyframe transitions)
+        """
         inliers = int(np.clip(
             self._rng.normal(self.ransac_inlier_mean, self.ransac_inlier_std),
-            20, 600))
-        # Scale-dependent noise: more inliers → less noise
-        noise_scale = self._ransac_noise_sigma / np.sqrt(max(inliers, 1) / 100.0)
+            20, 5000))
 
         dropout = self._rng.random() < self._dropout_rate
         if dropout:
             return 0.0, 0.0, 0.0, 1.0, 0, False
 
-        # H maps current→reference, so measurement ≈ -sway (the correction)
-        meas_tx = -gt_tx + self._rng.normal(0, noise_scale)
-        meas_ty = -gt_ty + self._rng.normal(0, noise_scale)
-        meas_theta = -gt_theta + self._rng.normal(0, noise_scale * 0.02)
-        meas_scale = 1.0 + self._rng.normal(0, 0.001)
+        # tx: light-tailed noise (uniform + small Gaussian)
+        noise_tx = self._ransac_noise_sigma * (
+            0.7 * self._rng.uniform(-1, 1) + 0.3 * self._rng.normal(0, 1))
+
+        # ty: heavy-tailed noise (t-distribution with df=4)
+        noise_ty = self._ransac_noise_sigma * 0.3 * self._rng.standard_t(4)
+
+        # H maps current→reference, so measurement ≈ -sway
+        meas_tx = -gt_tx + noise_tx
+        meas_ty = -gt_ty + noise_ty
+        meas_theta = -gt_theta + self._rng.normal(0, 0.005)
+        meas_scale = 1.0 + self._rng.normal(0, 0.0002)
 
         return meas_tx, meas_ty, meas_theta, meas_scale, inliers, True
 
@@ -112,27 +124,29 @@ class StabilizerEnv(gym.Env):
         self._walk_y = 0.0
 
         if self.domain_randomize:
-            self._sway_amp_x = self._rng.uniform(4.0, 12.0)
-            self._sway_amp_y = self._rng.uniform(3.0, 9.0)
-            self._sway_freq_x = self._rng.uniform(0.10, 0.25)
-            self._sway_freq_y = self._rng.uniform(0.08, 0.20)
-            self._walk_sigma = self._rng.uniform(1.0, 4.0)
-            self._walk_ar = self._rng.uniform(0.85, 0.95)
-            self._rot_amp = self._rng.uniform(0.2, 0.8)
+            # Ranges calibrated from real video data
+            self._sway_amp_x = self._rng.uniform(10.0, 50.0)
+            self._sway_amp_y = self._rng.uniform(1.0, 8.0)
+            self._sway_freq_x = self._rng.uniform(0.05, 0.20)
+            self._sway_freq_y = self._rng.uniform(0.05, 0.15)
+            self._walk_sigma = self._rng.uniform(1.0, 5.0)
+            self._walk_ar = self._rng.uniform(0.85, 0.98)
+            self._rot_amp = self._rng.uniform(0.005, 0.05)
             self._rot_freq = self._rng.uniform(0.4, 1.2)
-            self._ransac_noise_sigma = self._rng.uniform(0.5, 3.0)
-            self._dropout_rate = self._rng.uniform(0.02, 0.10)
+            self._ransac_noise_sigma = self._rng.uniform(0.5, 2.0)
+            self._dropout_rate = self._rng.uniform(0.0, 0.01)
         else:
-            self._sway_amp_x = 8.0
-            self._sway_amp_y = 6.0
-            self._sway_freq_x = 0.15
-            self._sway_freq_y = 0.12
-            self._walk_sigma = 2.0
-            self._walk_ar = 0.90
-            self._rot_amp = 0.5
+            # Defaults matching the real ArUco video
+            self._sway_amp_x = 24.0
+            self._sway_amp_y = 2.5
+            self._sway_freq_x = 0.10
+            self._sway_freq_y = 0.10
+            self._walk_sigma = 3.0
+            self._walk_ar = 0.95
+            self._rot_amp = 0.012
             self._rot_freq = 0.8
-            self._ransac_noise_sigma = 1.5
-            self._dropout_rate = 0.05
+            self._ransac_noise_sigma = 1.14
+            self._dropout_rate = 0.002
 
         # History buffers (ring buffer)
         H = self.history_length
