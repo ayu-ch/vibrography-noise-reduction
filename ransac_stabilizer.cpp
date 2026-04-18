@@ -4,6 +4,7 @@
 #include <opencv2/cudafeatures2d.hpp>
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudaoptflow.hpp>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -47,6 +48,134 @@ struct DisplacementData {
     double error_magnitude;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Stage 2 — Farneback Dense Optical Flow Residual Correction
+//
+//  After RANSAC removes the large motion (~50px), there's ~0.8px residual.
+//  Farneback computes dense flow between the stabilized frame and the
+//  reference (frame 0), takes the median background flow as the residual,
+//  and applies a small translational correction.
+//
+//  This is integrated directly into the RANSAC stabilizer so both stages
+//  run in a single pass per frame.
+// ─────────────────────────────────────────────────────────────────────────────
+
+class FarnebackRefinement {
+public:
+    FarnebackRefinement() {
+        farneback_ = cv::cuda::FarnebackOpticalFlow::create();
+        farneback_->setNumLevels(3);
+        farneback_->setPyrScale(0.5);
+        farneback_->setWinSize(15);
+        farneback_->setNumIters(3);
+        farneback_->setPolyN(5);
+        farneback_->setPolySigma(1.2);
+        farneback_->setFlags(0);
+    }
+
+    // Call once with the first stabilized frame to set the reference
+    void setReference(const cv::Mat& ref_frame) {
+        cv::Mat gray;
+        cv::cvtColor(ref_frame, gray, cv::COLOR_BGR2GRAY);
+        ref_gray_gpu_.upload(gray);
+        ref_set_ = true;
+    }
+
+    // Refine a RANSAC-stabilized frame: compute residual flow, correct it
+    cv::Mat refine(const cv::Mat& stabilized, double& residual_dx, double& residual_dy) {
+        residual_dx = 0.0;
+        residual_dy = 0.0;
+
+        if (!ref_set_) {
+            setReference(stabilized);
+            return stabilized.clone();
+        }
+
+        // Convert to gray and upload
+        cv::Mat gray;
+        cv::cvtColor(stabilized, gray, cv::COLOR_BGR2GRAY);
+        cv::cuda::GpuMat cur_gpu;
+        cur_gpu.upload(gray);
+
+        // Dense optical flow on GPU
+        cv::cuda::GpuMat flow_gpu;
+        farneback_->calc(ref_gray_gpu_, cur_gpu, flow_gpu);
+
+        // Download flow
+        cv::Mat flow;
+        flow_gpu.download(flow);
+
+        // Build mask: exclude centre marker region + borders
+        if (bg_mask_.empty() || bg_mask_.size() != flow.size()) {
+            bg_mask_ = cv::Mat::ones(flow.rows, flow.cols, CV_8U);
+            int cx = flow.cols / 2, cy = flow.rows / 2;
+            int half = (ARUCO_SIZE + 2 * EXCLUSION_MARGIN) / 2;
+            cv::Rect roi(cx - half, cy - half, half * 2, half * 2);
+            roi &= cv::Rect(0, 0, flow.cols, flow.rows);  // clamp to frame
+            bg_mask_(roi) = 0;
+            // Exclude 20px border (warp artifacts)
+            bg_mask_(cv::Rect(0, 0, flow.cols, 20)) = 0;
+            bg_mask_(cv::Rect(0, flow.rows - 20, flow.cols, 20)) = 0;
+            bg_mask_(cv::Rect(0, 0, 20, flow.rows)) = 0;
+            bg_mask_(cv::Rect(flow.cols - 20, 0, 20, flow.rows)) = 0;
+        }
+
+        // Collect background flow samples
+        std::vector<float> bg_dx, bg_dy;
+        bg_dx.reserve(200000);
+        bg_dy.reserve(200000);
+        for (int y = 0; y < flow.rows; ++y) {
+            const auto* frow = flow.ptr<cv::Vec2f>(y);
+            const auto* mrow = bg_mask_.ptr<uchar>(y);
+            for (int x = 0; x < flow.cols; ++x) {
+                if (mrow[x]) {
+                    bg_dx.push_back(frow[x][0]);
+                    bg_dy.push_back(frow[x][1]);
+                }
+            }
+        }
+
+        if (bg_dx.empty()) return stabilized.clone();
+
+        // Median = robust estimate of residual camera motion
+        residual_dx = median(bg_dx);
+        residual_dy = median(bg_dy);
+
+        // Only correct if residual is above noise floor
+        if (std::abs(residual_dx) < 0.02 && std::abs(residual_dy) < 0.02)
+            return stabilized.clone();
+
+        // Apply translational correction on GPU
+        cv::Mat H_corr = cv::Mat::eye(3, 3, CV_64F);
+        H_corr.at<double>(0, 2) = -residual_dx;
+        H_corr.at<double>(1, 2) = -residual_dy;
+
+        cv::cuda::GpuMat gpu_in, gpu_out;
+        gpu_in.upload(stabilized);
+        cv::cuda::warpPerspective(gpu_in, gpu_out, H_corr, stabilized.size(),
+                                  cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+        cv::Mat corrected;
+        gpu_out.download(corrected);
+        return corrected;
+    }
+
+private:
+    static double median(std::vector<float> v) {
+        size_t n = v.size();
+        auto mid = v.begin() + n / 2;
+        std::nth_element(v.begin(), mid, v.end());
+        if (n % 2 == 1) return *mid;
+        auto mid2 = std::max_element(v.begin(), mid);
+        return (static_cast<double>(*mid) + *mid2) / 2.0;
+    }
+
+    cv::Ptr<cv::cuda::FarnebackOpticalFlow> farneback_;
+    cv::cuda::GpuMat ref_gray_gpu_;
+    cv::Mat bg_mask_;
+    bool ref_set_ = false;
+};
+
+
 class RansacStabilizer {
 public:
     struct Metrics {
@@ -63,6 +192,9 @@ public:
         double ty = 0.0;
         double rotation_deg = 0.0;
         double scale = 1.0;
+        // Stage 2 Farneback residual correction
+        double farneback_dx = 0.0;
+        double farneback_dy = 0.0;
     };
 
     RansacStabilizer()
@@ -462,6 +594,7 @@ void processDataset(const std::string& input_dir, const std::string& output_dir)
 
 void processVideo(const std::string& video_path, const std::string& output_dir, int max_frames = 0) {
     RansacStabilizer stabilizer;
+    FarnebackRefinement farneback;
     fs::create_directories(output_dir);
 
     cv::VideoCapture cap(video_path);
@@ -483,6 +616,7 @@ void processVideo(const std::string& video_path, const std::string& output_dir, 
     std::ofstream csv(output_dir + "/compensation.csv");
     csv << "frame_id,tx_px,ty_px,rotation_deg,scale,"
            "keypoints_found,good_matches,inliers,homography_valid,"
+           "farneback_dx,farneback_dy,"
            "aruco_detected,aruco_center_x,aruco_center_y\n";
 
     cv::VideoWriter writer(
@@ -507,6 +641,10 @@ void processVideo(const std::string& video_path, const std::string& output_dir, 
 
         RansacStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
+
+        // Stage 2: Farneback residual correction
+        stabilized = farneback.refine(stabilized, m.farneback_dx, m.farneback_dy);
+
         if (writer.isOpened()) writer.write(stabilized);
 
         cv::Point2f center = stabilizer.detectArUcoCenter(stabilized, m);
@@ -516,6 +654,7 @@ void processVideo(const std::string& video_path, const std::string& output_dir, 
             << m.rotation_deg << "," << m.scale << ","
             << m.keypoints_found << "," << m.good_matches << "," << m.inliers << ","
             << m.homography_valid << ","
+            << m.farneback_dx << "," << m.farneback_dy << ","
             << m.aruco_detected << ","
             << m.aruco_center.x << "," << m.aruco_center.y << "\n";
 
