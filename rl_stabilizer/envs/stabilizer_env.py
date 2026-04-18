@@ -41,11 +41,14 @@ class StabilizerEnv(gym.Env):
         self.observation_space = spaces.Box(
             -np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
 
-        # Action scaling bounds (matched to real video: 48px X, 5px Y sway)
-        self.tx_max = 50.0
-        self.ty_max = 10.0
-        self.theta_max = 0.05
-        self.scale_half = 0.002
+        # Action = small DELTA on top of the raw RANSAC measurement.
+        # The agent doesn't output the full correction — it outputs a
+        # refinement. This makes learning much easier because the raw
+        # RANSAC is already ~90% correct; the agent just fixes the noise.
+        self.delta_tx_max = 5.0     # max adjustment ±5px on top of RANSAC
+        self.delta_ty_max = 3.0     # max adjustment ±3px
+        self.delta_theta_max = 0.02 # max adjustment ±0.02°
+        self.delta_scale_max = 0.001
 
         # Normalization
         self.norm_t = 50.0
@@ -167,11 +170,17 @@ class StabilizerEnv(gym.Env):
         return obs, {}
 
     def step(self, action):
-        # Rescale action from [-1, 1] to physical units
-        act_tx    = float(action[0]) * self.tx_max
-        act_ty    = float(action[1]) * self.ty_max
-        act_theta = float(action[2]) * self.theta_max
-        act_scale = 1.0 + float(action[3]) * self.scale_half
+        # Action = delta on top of raw RANSAC measurement
+        # Final correction = RANSAC + agent's delta
+        delta_tx    = float(action[0]) * self.delta_tx_max
+        delta_ty    = float(action[1]) * self.delta_ty_max
+        delta_theta = float(action[2]) * self.delta_theta_max
+        delta_scale = float(action[3]) * self.delta_scale_max
+
+        act_tx    = self._meas_tx + delta_tx
+        act_ty    = self._meas_ty + delta_ty
+        act_theta = self._meas_theta + delta_theta
+        act_scale = self._meas_scale + delta_scale
 
         # ── Reward ────────────────────────────────────────────────────────
         # Residual = gt_sway + applied correction (H maps current→ref)
