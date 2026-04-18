@@ -36,17 +36,18 @@ class FlowCNN(BaseFeaturesExtractor):
     """
     Extracts features from the flattened flow + action + time observation.
 
-    1. Reshape the first (flow_w × flow_h × 2) elements into a 2-channel image
+    1. Reshape the first (flow_w × flow_h × 2) elements into residual flow image
     2. Pass through 3 conv layers → flatten → 256-dim feature vector
-    3. Concat with prev_action (4) and time (1) → 261-dim output
+    3. Concat with mean_flow(2) + prev_delta(4) + time(1) → 263-dim output
     """
 
     def __init__(self, observation_space: gym.spaces.Box,
-                 flow_w=60, flow_h=45, features_dim=261):
+                 flow_w=60, flow_h=45, features_dim=263):
         super().__init__(observation_space, features_dim)
         self.flow_w = flow_w
         self.flow_h = flow_h
         self.flow_size = flow_w * flow_h * 2
+        self.extras_size = 2 + 4 + 1   # mean_flow + prev_delta + time
 
         self.cnn = nn.Sequential(
             nn.Conv2d(2, 16, kernel_size=5, stride=2, padding=2),
@@ -59,7 +60,6 @@ class FlowCNN(BaseFeaturesExtractor):
             nn.Flatten(),
         )
 
-        # Compute CNN output dim
         with torch.no_grad():
             dummy = torch.zeros(1, 2, flow_h, flow_w)
             cnn_out = self.cnn(dummy).shape[1]
@@ -69,8 +69,8 @@ class FlowCNN(BaseFeaturesExtractor):
             nn.ReLU(),
         )
 
-        # Final features = 256 (from CNN) + 4 (prev_action) + 1 (time) = 261
-        self._features_dim = 256 + 5
+        # 256 (CNN) + 2 (mean_flow) + 4 (prev_delta) + 1 (time) = 263
+        self._features_dim = 256 + self.extras_size
 
     @property
     def features_dim(self):
@@ -79,19 +79,16 @@ class FlowCNN(BaseFeaturesExtractor):
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         batch_size = observations.shape[0]
 
-        # Split observation into flow + extras
-        flow_flat = observations[:, :self.flow_size]
-        extras = observations[:, self.flow_size:]  # prev_action(4) + time(1)
+        # Split: residual flow | mean_flow(2) + prev_delta(4) + time(1)
+        residual_flat = observations[:, :self.flow_size]
+        extras = observations[:, self.flow_size:]  # 7 floats
 
-        # Reshape flow to (batch, 2, H, W)
-        flow_2d = flow_flat.reshape(batch_size, self.flow_h, self.flow_w, 2)
-        flow_2d = flow_2d.permute(0, 3, 1, 2)  # → (batch, 2, H, W)
+        # Reshape residual flow to (batch, 2, H, W)
+        flow_2d = residual_flat.reshape(batch_size, self.flow_h, self.flow_w, 2)
+        flow_2d = flow_2d.permute(0, 3, 1, 2)
 
-        # CNN
         cnn_features = self.fc(self.cnn(flow_2d))  # → (batch, 256)
-
-        # Concat with extras
-        return torch.cat([cnn_features, extras], dim=1)  # → (batch, 261)
+        return torch.cat([cnn_features, extras], dim=1)  # → (batch, 263)
 
 
 # ── Environment factories ─────────────────────────────────────────────────────
