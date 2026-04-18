@@ -1,1 +1,1 @@
-from .stabilizer_env import StabilizerEnv
+from .flow_stabilizer_env import FlowStabilizerEnv
