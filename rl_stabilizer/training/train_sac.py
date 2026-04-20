@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Train SAC v2 — Full RANSAC replacement using optical flow input.
+Train SAC — Phase correlation base + MLP delta refinement.
 
-The policy uses a CNN to process the downsampled flow field, followed
-by an MLP to output [tx, ty, θ, scale].
+The observation is compact enough for a plain MLP (no CNN needed):
+- Phase correlation shift (2)
+- Patch statistics (4)
+- Previous delta (4)
+- Time (1)
+- Frame difference (60×45 = 2700)
+Total: ~2711 floats
 
 Usage:
-    python -m rl_stabilizer.training.train_sac_v2
-    python -m rl_stabilizer.training.train_sac_v2 --timesteps 500000 --name flow_test
+    python -m rl_stabilizer.training.train_sac
+    python -m rl_stabilizer.training.train_sac --timesteps 500000 --name phase_delta
 """
 
 import argparse
@@ -16,82 +21,15 @@ from pathlib import Path
 
 import torch
 import torch.nn as nn
-import yaml
-import gymnasium as gym
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from stable_baselines3 import SAC
 from stable_baselines3.common.vec_env import SubprocVecEnv
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from rl_stabilizer.envs.flow_stabilizer_env import FlowStabilizerEnv
 
-
-# ── Custom CNN feature extractor for optical flow ────────────────────────────
-
-class FlowCNN(BaseFeaturesExtractor):
-    """
-    Extracts features from the flattened flow + action + time observation.
-
-    1. Reshape the first (flow_w × flow_h × 2) elements into residual flow image
-    2. Pass through 3 conv layers → flatten → 256-dim feature vector
-    3. Concat with mean_flow(2) + prev_delta(4) + time(1) → 263-dim output
-    """
-
-    def __init__(self, observation_space: gym.spaces.Box,
-                 flow_w=60, flow_h=45, features_dim=263):
-        super().__init__(observation_space, features_dim)
-        self.flow_w = flow_w
-        self.flow_h = flow_h
-        self.flow_size = flow_w * flow_h * 2
-        self.extras_size = 2 + 4 + 1   # mean_flow + prev_delta + time
-
-        self.cnn = nn.Sequential(
-            nn.Conv2d(2, 16, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(),
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d((4, 4)),
-            nn.Flatten(),
-        )
-
-        with torch.no_grad():
-            dummy = torch.zeros(1, 2, flow_h, flow_w)
-            cnn_out = self.cnn(dummy).shape[1]
-
-        self.fc = nn.Sequential(
-            nn.Linear(cnn_out, 256),
-            nn.ReLU(),
-        )
-
-        # 256 (CNN) + 2 (mean_flow) + 4 (prev_delta) + 1 (time) = 263
-        self._features_dim = 256 + self.extras_size
-
-    @property
-    def features_dim(self):
-        return self._features_dim
-
-    def forward(self, observations: torch.Tensor) -> torch.Tensor:
-        batch_size = observations.shape[0]
-
-        # Split: residual flow | mean_flow(2) + prev_delta(4) + time(1)
-        residual_flat = observations[:, :self.flow_size]
-        extras = observations[:, self.flow_size:]  # 7 floats
-
-        # Reshape residual flow to (batch, 2, H, W)
-        flow_2d = residual_flat.reshape(batch_size, self.flow_h, self.flow_w, 2)
-        flow_2d = flow_2d.permute(0, 3, 1, 2)
-
-        cnn_features = self.fc(self.cnn(flow_2d))  # → (batch, 256)
-        return torch.cat([cnn_features, extras], dim=1)  # → (batch, 263)
-
-
-# ── Environment factories ─────────────────────────────────────────────────────
 
 def make_env(seed, domain_randomize=True):
     def _init():
@@ -104,15 +42,12 @@ def make_eval_env(seed):
     return _init
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
 def main():
-    parser = argparse.ArgumentParser(description="Train SAC v2 (flow-based)")
+    parser = argparse.ArgumentParser(description="Train SAC (phase correlation + delta)")
     parser.add_argument("--timesteps", type=int, default=500000)
-    parser.add_argument("--name", type=str, default="flow_sac")
+    parser.add_argument("--name", type=str, default="phase_delta")
     parser.add_argument("--device", type=str, default="auto")
-    parser.add_argument("--n_envs", type=int, default=4,
-                        help="Parallel envs (lower than v1 because flow is slower)")
+    parser.add_argument("--n_envs", type=int, default=4)
     args = parser.parse_args()
 
     output_dir = Path(__file__).resolve().parents[1] / "runs" / args.name
@@ -122,21 +57,21 @@ def main():
     train_envs = SubprocVecEnv([make_env(i) for i in range(args.n_envs)])
     eval_env = SubprocVecEnv([make_eval_env(999)])
 
+    # Plain MLP — no CNN needed. Phase correlation handles translation,
+    # the MLP reads the frame difference to detect rotation patterns.
     policy_kwargs = dict(
-        features_extractor_class=FlowCNN,
-        features_extractor_kwargs=dict(flow_w=60, flow_h=45),
-        net_arch=[256, 128],  # MLP after CNN features
+        net_arch=[256, 256, 128],
         activation_fn=nn.ReLU,
     )
 
-    print(f"Initializing SAC with FlowCNN extractor...")
+    print("Initializing SAC with MLP policy...")
     model = SAC(
         "MlpPolicy",
         train_envs,
         policy_kwargs=policy_kwargs,
         learning_rate=3e-4,
-        buffer_size=500000,      # smaller buffer (each obs is 5405 floats)
-        batch_size=128,          # smaller batch (larger obs)
+        buffer_size=500000,
+        batch_size=256,
         gamma=0.99,
         tau=0.005,
         ent_coef="auto",
@@ -150,7 +85,7 @@ def main():
     checkpoint_cb = CheckpointCallback(
         save_freq=max(25000 // args.n_envs, 1),
         save_path=str(output_dir / "checkpoints"),
-        name_prefix="sac_flow",
+        name_prefix="sac",
     )
     eval_cb = EvalCallback(
         eval_env,
