@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <numeric>
 #include <filesystem>
 #include <fstream>
 #include <nlohmann/json.hpp>
@@ -37,7 +38,8 @@ static constexpr double HOMOGRAPHY_CONFIDENCE = 0.995;  // Higher confidence
 // Reference refresh: update reference when inlier ratio drops below this
 // to prevent match degradation as the scene drifts from frame 0.
 static constexpr double MIN_INLIER_RATIO = 0.10;
-static constexpr int    KEYFRAME_INTERVAL = 100;  // refresh keyframe every N frames // 10% of good matches must be inliers
+static constexpr int    KEYFRAME_INTERVAL = 100;  // refresh keyframe every N frames
+static constexpr int    ROT_SMOOTH_N = 10;        // smooth rotation over N frames
 static constexpr int    REFRESH_INLIER_THRESHOLD = 60; // refresh if inliers < this
 
 
@@ -81,12 +83,20 @@ public:
         ref_set_ = true;
     }
 
-    // Refine a RANSAC-stabilized frame: compute residual flow, correct it
-    cv::Mat refine(const cv::Mat& stabilized, double& residual_dx, double& residual_dy) {
+    // Refine a RANSAC-stabilized frame: compute residual flow, correct
+    // both translation AND rotation residuals.
+    cv::Mat refine(const cv::Mat& stabilized, double& residual_dx, double& residual_dy,
+                   int frame_idx = -1) {
         residual_dx = 0.0;
         residual_dy = 0.0;
 
         if (!ref_set_) {
+            setReference(stabilized);
+            return stabilized.clone();
+        }
+
+        // Refresh reference every 500 frames to prevent drift
+        if (frame_idx > 0 && frame_idx % 500 == 0) {
             setReference(stabilized);
             return stabilized.clone();
         }
@@ -101,7 +111,6 @@ public:
         cv::cuda::GpuMat flow_gpu;
         farneback_->calc(ref_gray_gpu_, cur_gpu, flow_gpu);
 
-        // Download flow
         cv::Mat flow;
         flow_gpu.download(flow);
 
@@ -111,44 +120,59 @@ public:
             int cx = flow.cols / 2, cy = flow.rows / 2;
             int half = (ARUCO_SIZE + 2 * EXCLUSION_MARGIN) / 2;
             cv::Rect roi(cx - half, cy - half, half * 2, half * 2);
-            roi &= cv::Rect(0, 0, flow.cols, flow.rows);  // clamp to frame
+            roi &= cv::Rect(0, 0, flow.cols, flow.rows);
             bg_mask_(roi) = 0;
-            // Exclude 20px border (warp artifacts)
             bg_mask_(cv::Rect(0, 0, flow.cols, 20)) = 0;
             bg_mask_(cv::Rect(0, flow.rows - 20, flow.cols, 20)) = 0;
             bg_mask_(cv::Rect(0, 0, 20, flow.rows)) = 0;
             bg_mask_(cv::Rect(flow.cols - 20, 0, 20, flow.rows)) = 0;
         }
 
-        // Collect background flow samples
-        std::vector<float> bg_dx, bg_dy;
-        bg_dx.reserve(200000);
-        bg_dy.reserve(200000);
-        for (int y = 0; y < flow.rows; ++y) {
+        // Collect background flow samples WITH positions (for rotation estimation)
+        std::vector<cv::Point2f> src_pts, dst_pts;
+        src_pts.reserve(5000);
+        dst_pts.reserve(5000);
+
+        // Sample every 8th pixel in the background mask (enough for rigid fit)
+        for (int y = 20; y < flow.rows - 20; y += 8) {
             const auto* frow = flow.ptr<cv::Vec2f>(y);
             const auto* mrow = bg_mask_.ptr<uchar>(y);
-            for (int x = 0; x < flow.cols; ++x) {
+            for (int x = 20; x < flow.cols - 20; x += 8) {
                 if (mrow[x]) {
-                    bg_dx.push_back(frow[x][0]);
-                    bg_dy.push_back(frow[x][1]);
+                    src_pts.push_back(cv::Point2f(x + frow[x][0], y + frow[x][1]));
+                    dst_pts.push_back(cv::Point2f(x, y));
                 }
             }
         }
 
-        if (bg_dx.empty()) return stabilized.clone();
+        if (src_pts.size() < 10) return stabilized.clone();
 
-        // Median = robust estimate of residual camera motion
-        residual_dx = median(bg_dx);
-        residual_dy = median(bg_dy);
+        // Fit rigid transform (translation + rotation) to the flow field
+        // This extracts both residual translation AND residual rotation
+        cv::Mat rigid = cv::estimateAffinePartial2D(src_pts, dst_pts,
+                                                     cv::noArray(), cv::RANSAC, 1.5);
+
+        if (rigid.empty()) return stabilized.clone();
+
+        double res_tx = rigid.at<double>(0, 2);
+        double res_ty = rigid.at<double>(1, 2);
+        residual_dx = res_tx;
+        residual_dy = res_ty;
 
         // Only correct if residual is above noise floor
-        if (std::abs(residual_dx) < 0.02 && std::abs(residual_dy) < 0.02)
+        double residual_mag = std::sqrt(res_tx*res_tx + res_ty*res_ty);
+        double res_rot = std::atan2(rigid.at<double>(1, 0), rigid.at<double>(0, 0));
+        if (residual_mag < 0.02 && std::abs(res_rot) < 1e-5)
             return stabilized.clone();
 
-        // Apply translational correction on GPU
+        // Apply rigid correction (translation + rotation) on GPU
         cv::Mat H_corr = cv::Mat::eye(3, 3, CV_64F);
-        H_corr.at<double>(0, 2) = -residual_dx;
-        H_corr.at<double>(1, 2) = -residual_dy;
+        H_corr.at<double>(0, 0) = rigid.at<double>(0, 0);
+        H_corr.at<double>(0, 1) = rigid.at<double>(0, 1);
+        H_corr.at<double>(0, 2) = rigid.at<double>(0, 2);
+        H_corr.at<double>(1, 0) = rigid.at<double>(1, 0);
+        H_corr.at<double>(1, 1) = rigid.at<double>(1, 1);
+        H_corr.at<double>(1, 2) = rigid.at<double>(1, 2);
 
         cv::cuda::GpuMat gpu_in, gpu_out;
         gpu_in.upload(stabilized);
@@ -160,15 +184,6 @@ public:
     }
 
 private:
-    static double median(std::vector<float> v) {
-        size_t n = v.size();
-        auto mid = v.begin() + n / 2;
-        std::nth_element(v.begin(), mid, v.end());
-        if (n % 2 == 1) return *mid;
-        auto mid2 = std::max_element(v.begin(), mid);
-        return (static_cast<double>(*mid) + *mid2) / 2.0;
-    }
-
     cv::Ptr<cv::cuda::FarnebackOpticalFlow> farneback_;
     cv::cuda::GpuMat ref_gray_gpu_;
     cv::Mat bg_mask_;
@@ -334,21 +349,40 @@ public:
             H_total = last_valid_H_;
         }
 
-        // ── 5. Decompose and apply H ──────────────────────────────────────
+        // ── 5. Decompose H ─────────────────────────────────────────────────
         if (!H_total.empty()) {
             m.tx           = H_total.at<double>(0, 2);
             m.ty           = H_total.at<double>(1, 2);
             m.scale        = std::sqrt(H_total.at<double>(0,0)*H_total.at<double>(0,0) +
                                        H_total.at<double>(1,0)*H_total.at<double>(1,0));
-            m.rotation_deg = std::atan2(H_total.at<double>(1,0),
+            double raw_rot = std::atan2(H_total.at<double>(1,0),
                                         H_total.at<double>(0,0)) * 180.0 / CV_PI;
+
+            // Smooth rotation over ROT_SMOOTH_N frames (rotation changes slowly,
+            // but RANSAC estimates it noisily — smoothing reduces edge vibration)
+            rot_buffer_.push_back(raw_rot);
+            if (static_cast<int>(rot_buffer_.size()) > ROT_SMOOTH_N)
+                rot_buffer_.erase(rot_buffer_.begin());
+            m.rotation_deg = std::accumulate(rot_buffer_.begin(), rot_buffer_.end(), 0.0)
+                           / static_cast<double>(rot_buffer_.size());
         }
 
-        // ── 6. Apply warp ──────────────────────────────────────────────────
+        // ── 6. Reconstruct smoothed H and apply warp ──────────────────────
         cv::Mat stabilized;
         if (!H_total.empty()) {
+            double theta_rad = m.rotation_deg * CV_PI / 180.0;
+            double cos_t = m.scale * std::cos(theta_rad);
+            double sin_t = m.scale * std::sin(theta_rad);
+            cv::Mat H_smooth = cv::Mat::eye(3, 3, CV_64F);
+            H_smooth.at<double>(0, 0) =  cos_t;
+            H_smooth.at<double>(0, 1) = -sin_t;
+            H_smooth.at<double>(0, 2) =  m.tx;
+            H_smooth.at<double>(1, 0) =  sin_t;
+            H_smooth.at<double>(1, 1) =  cos_t;
+            H_smooth.at<double>(1, 2) =  m.ty;
+
             cv::cuda::GpuMat gpu_stabilized;
-            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H_total, frame.size(),
+            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H_smooth, frame.size(),
                                       cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
             gpu_stabilized.download(stabilized);
         } else {
@@ -424,6 +458,7 @@ private:
     cv::cuda::GpuMat keyframe_desc_gpu_;
     cv::Mat H_accumulated_;       // keyframe → frame 0
     cv::Mat last_valid_H_;        // last good total H (fallback)
+    std::vector<double> rot_buffer_;  // rotation smoothing buffer
 };
 
 
@@ -642,8 +677,8 @@ void processVideo(const std::string& video_path, const std::string& output_dir, 
         RansacStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
 
-        // Stage 2: Farneback residual correction
-        stabilized = farneback.refine(stabilized, m.farneback_dx, m.farneback_dy);
+        // Stage 2: Farneback residual correction (translation + rotation)
+        stabilized = farneback.refine(stabilized, m.farneback_dx, m.farneback_dy, frame_idx);
 
         if (writer.isOpened()) writer.write(stabilized);
 
