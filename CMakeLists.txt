@@ -25,9 +25,21 @@ target_link_libraries(aruco_homography
 
 # RANSAC Stabilizer with ArUco Displacement Tracking
 add_executable(ransac_stabilizer ransac_stabilizer.cpp)
-target_link_libraries(ransac_stabilizer 
+target_link_libraries(ransac_stabilizer
     ${OpenCV_LIBS}
 )
+
+# RL Stabilizer — Phase Correlation + ONNX Policy (optional, needs onnxruntime)
+find_library(ONNXRUNTIME_LIB onnxruntime HINTS /usr/local/lib $ENV{HOME}/local/lib)
+find_path(ONNXRUNTIME_INCLUDE onnxruntime_cxx_api.h HINTS /usr/local/include $ENV{HOME}/local/include)
+if(ONNXRUNTIME_LIB AND ONNXRUNTIME_INCLUDE)
+    add_executable(rl_stabilizer rl_stabilizer.cpp)
+    target_include_directories(rl_stabilizer PRIVATE ${ONNXRUNTIME_INCLUDE})
+    target_link_libraries(rl_stabilizer ${OpenCV_LIBS} ${ONNXRUNTIME_LIB})
+    message(STATUS "ONNX Runtime found — building rl_stabilizer")
+else()
+    message(STATUS "ONNX Runtime not found — skipping rl_stabilizer (install onnxruntime to enable)")
+endif()
 
 # Set default build type
 if(NOT CMAKE_BUILD_TYPE)
