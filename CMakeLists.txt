@@ -41,6 +41,18 @@ else()
     message(STATUS "ONNX Runtime not found — skipping rl_stabilizer (install onnxruntime to enable)")
 endif()
 
+# DIC Analysis — cuFFT Phase Correlation (needs CUDA toolkit)
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+    enable_language(CUDA)
+    add_executable(dic_analysis dic_analysis.cu)
+    target_link_libraries(dic_analysis ${OpenCV_LIBS} CUDA::cufft CUDA::cudart)
+    set_target_properties(dic_analysis PROPERTIES CUDA_ARCHITECTURES "70")
+    message(STATUS "CUDA toolkit found — building dic_analysis")
+else()
+    message(STATUS "CUDA toolkit not found — skipping dic_analysis")
+endif()
+
 # Set default build type
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
