@@ -153,27 +153,31 @@ __global__ void applyHanning1DKernel(float* data, int n_frames, int n_rois) {
     data[idx] *= w;
 }
 
-// High-pass filter: subtract a moving average to remove slow drift
-// This reveals the actual vibration signal hidden under the ~2Hz camera drift
-__global__ void highPassFilterKernel(float* data, int n_frames, int n_rois, int window) {
-    int roi = blockIdx.x * blockDim.x + threadIdx.x;
-    if (roi >= n_rois) return;
+// High-pass filter (two-pass): compute moving average into a temp buffer,
+// then subtract it from the original signal. This removes slow drift
+// (e.g. residual ~2Hz camera sway) so the vibration spectrum dominates.
+// One thread per (roi, frame) pair — each computes one MA sample.
+__global__ void movingAverageKernel(const float* __restrict__ in, float* out,
+                                    int n_frames, int n_rois, int window) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = n_rois * n_frames;
+    if (idx >= total) return;
 
-    float* ts = data + roi * n_frames;
+    int roi   = idx / n_frames;
+    int frame = idx % n_frames;
+    const float* ts = in + roi * n_frames;
 
-    // Compute moving average and subtract
-    for (int i = 0; i < n_frames; i++) {
-        float sum = 0;
-        int count = 0;
-        for (int j = max(0, i - window/2); j < min(n_frames, i + window/2 + 1); j++) {
-            sum += ts[j];
-            count++;
-        }
-        // Store filtered value (in-place is OK since we read before write)
-        // Actually need a temp buffer — use shared memory or two-pass
-    }
-    // Two-pass: first compute MA into temp, then subtract
-    // For simplicity, do it on CPU instead
+    int lo = max(0, frame - window / 2);
+    int hi = min(n_frames, frame + window / 2 + 1);
+    float sum = 0.0f;
+    for (int j = lo; j < hi; j++) sum += ts[j];
+    out[idx] = sum / (hi - lo);
+}
+
+__global__ void subtractInPlaceKernel(float* a, const float* b, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+    a[idx] -= b[idx];
 }
 
 
@@ -193,13 +197,6 @@ public:
         double phase_rad;           // vibration phase
         double mean_dx, mean_dy;    // mean displacement (DC component)
     };
-
-    // Per-frame displacement data (populated by analyze())
-    // Layout: displacement[roi_idx * fft_frames + frame_idx]
-    std::vector<float> frame_dx, frame_dy;
-    int n_rois_out = 0;
-    int fft_frames_out = 0;
-    int cols_out = 0, rows_out = 0;
 
     // Process stabilized video: extract vibration spectrum for each ROI
     std::vector<ROIResult> analyze(const std::string& video_path, int max_frames = 512) {
@@ -345,44 +342,38 @@ public:
         CUDA_CHECK(cudaMalloc(&d_spec_x, n_rois * spec_size * sizeof(cufftComplex)));
         CUDA_CHECK(cudaMalloc(&d_spec_y, n_rois * spec_size * sizeof(cufftComplex)));
 
-        // ── High-pass filter: remove slow drift (<5Hz) on CPU ─────────
-        // The ~2Hz camera drift dominates the raw displacement signal.
-        // Subtract a moving average (window=200 frames at 1000fps = 5Hz cutoff)
-        // to reveal the actual structural vibration.
-        int hp_window = static_cast<int>(fps_ / 5.0);  // 5Hz cutoff
-        if (hp_window < 3) hp_window = 3;
-        std::cout << "  High-pass filter: window=" << hp_window
-                  << " frames (>" << fps_/hp_window << " Hz pass)\n";
-
-        for (int roi = 0; roi < n_rois; roi++) {
-            float* tx = &all_dx[roi * fft_frames];
-            float* ty = &all_dy[roi * fft_frames];
-            // Compute moving average
-            std::vector<float> ma_x(fft_frames), ma_y(fft_frames);
-            for (int i = 0; i < fft_frames; i++) {
-                float sx = 0, sy = 0;
-                int cnt = 0;
-                for (int j = std::max(0, i - hp_window/2);
-                     j < std::min(fft_frames, i + hp_window/2 + 1); j++) {
-                    sx += tx[j]; sy += ty[j]; cnt++;
-                }
-                ma_x[i] = sx / cnt;
-                ma_y[i] = sy / cnt;
-            }
-            // Subtract: keep only high-frequency vibration
-            for (int i = 0; i < fft_frames; i++) {
-                tx[i] -= ma_x[i];
-                ty[i] -= ma_y[i];
-            }
-        }
-
+        // Upload raw displacement time series to GPU
         CUDA_CHECK(cudaMemcpy(d_disp_x, all_dx.data(),
                               n_rois * fft_frames * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(d_disp_y, all_dy.data(),
                               n_rois * fft_frames * sizeof(float), cudaMemcpyHostToDevice));
 
-        // Apply Hanning window to time series
+        // ── High-pass filter on GPU: subtract moving average ─────────────
+        // The ~2Hz camera drift dominates the raw displacement signal.
+        // Subtract a moving average (window = fps/5 → 5Hz cutoff) so the
+        // structural vibration band dominates the FFT.
+        int hp_window = static_cast<int>(fps_ / 5.0);
+        if (hp_window < 3) hp_window = 3;
+        std::cout << "  High-pass filter (GPU): window=" << hp_window
+                  << " frames (>" << fps_ / hp_window << " Hz pass)\n";
+
+        float* d_ma;
         int total_ts = n_rois * fft_frames;
+        CUDA_CHECK(cudaMalloc(&d_ma, total_ts * sizeof(float)));
+
+        movingAverageKernel<<<(total_ts + threads - 1) / threads, threads>>>(
+            d_disp_x, d_ma, fft_frames, n_rois, hp_window);
+        subtractInPlaceKernel<<<(total_ts + threads - 1) / threads, threads>>>(
+            d_disp_x, d_ma, total_ts);
+
+        movingAverageKernel<<<(total_ts + threads - 1) / threads, threads>>>(
+            d_disp_y, d_ma, fft_frames, n_rois, hp_window);
+        subtractInPlaceKernel<<<(total_ts + threads - 1) / threads, threads>>>(
+            d_disp_y, d_ma, total_ts);
+
+        cudaFree(d_ma);
+
+        // Apply Hanning window to time series
         applyHanning1DKernel<<<(total_ts + threads - 1) / threads, threads>>>(
             d_disp_x, fft_frames, n_rois);
         applyHanning1DKernel<<<(total_ts + threads - 1) / threads, threads>>>(
@@ -457,14 +448,6 @@ public:
                 all_dy[roi * fft_frames]
             };
         }
-
-        // Store per-frame data for overlay video
-        frame_dx = all_dx;
-        frame_dy = all_dy;
-        n_rois_out = n_rois;
-        fft_frames_out = fft_frames;
-        cols_out = cols;
-        rows_out = rows;
 
         // Cleanup
         cudaFree(d_ref_patches); cudaFree(d_cur_patches);
@@ -623,159 +606,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Dominant frequency: " << dom_freq << " Hz\n";
     std::cout << "Max amplitude: " << max_amp << " px\n";
     std::cout << "Frequency resolution: " << fps / max_frames << " Hz\n";
-
-    // ── Generate dynamic overlay video ─────────────────────────────────
-    // Each frame shows the per-ROI displacement magnitude as a live heatmap
-    // that pulses with the vibration. This makes the vibration VISIBLE.
-    std::cout << "\nGenerating dynamic overlay video...\n";
-
-    int n_rois = static_cast<int>(results.size());
-
-    // Read frequencies and amplitudes from results
-    std::vector<double> roi_freqs(n_rois), roi_amps(n_rois);
-    for (int i = 0; i < n_rois; i++) {
-        roi_freqs[i] = results[i].dominant_freq_hz;
-        roi_amps[i] = results[i].amplitude_px;
-    }
-
-    // (skip CSV re-read — we already have results)
-    if (false) {
-    std::ifstream csv_in(output_dir + "/vibration_analysis.csv");
-    std::string header_line;
-    std::getline(csv_in, header_line);
-    for (int i = 0; i < n_rois; i++) {
-        int rx_tmp, ry_tmp;
-        double f, a, p, mdx, mdy;
-        char comma;
-        csv_in >> rx_tmp >> comma >> ry_tmp >> comma >> f >> comma
-               >> a >> comma >> p >> comma >> mdx >> comma >> mdy;
-        roi_freqs[i] = f;
-        roi_amps[i] = a;
-    }
-    csv_in.close();
-    } // end if(false)
-
-    cv::VideoCapture cap2(input);
-    if (!cap2.isOpened()) {
-        std::cerr << "Cannot reopen video for overlay\n";
-        return 1;
-    }
-
-    int fft_frames_used = 1;
-    while (fft_frames_used * 2 <= max_frames) fft_frames_used *= 2;
-
-    cv::VideoWriter overlay_writer(
-        output_dir + "/vibration_overlay.avi",
-        cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
-        30.0, cv::Size(width, height));
-
-    int frame_idx2 = 0;
-    int limit_overlay = std::min(static_cast<int>(cap2.get(cv::CAP_PROP_FRAME_COUNT)),
-                                  fft_frames_used);
-
-    // Compute stats from speckle region only (skip edges/background)
-    // The speckle boards are the ROIs with ~45Hz signal
-    double vis_max_amp = 0;
-    double speckle_dom_freq = 0;
-    int speckle_count = 0;
-    for (int ri = 0; ri < n_rois; ri++) {
-        const auto& r = results[ri];
-        int src = ri % cols, srr = ri / cols;
-        // Only consider centre ROIs with real vibration (not edges)
-        if (src >= 3 && src < cols - 3 && srr >= 3 && srr < rows - 3 &&
-            r.dominant_freq_hz > 10.0 && r.dominant_freq_hz < 200.0 &&
-            r.amplitude_px > 0.005 && r.amplitude_px < 2.0) {
-            if (r.amplitude_px > vis_max_amp) {
-                vis_max_amp = r.amplitude_px;
-                speckle_dom_freq = r.dominant_freq_hz;
-            }
-            speckle_count++;
-        }
-    }
-    if (vis_max_amp < 0.01) vis_max_amp = 0.01;
-    std::cout << "  Speckle ROIs with vibration: " << speckle_count
-              << ", dominant: " << speckle_dom_freq << "Hz, max amp: " << vis_max_amp << "px\n";
-
-    cv::Mat overlay_frame;
-    while (cap2.read(overlay_frame) && frame_idx2 < limit_overlay) {
-        if (frame_idx2 % 100 == 0)
-            std::cout << "  Overlay: frame " << frame_idx2 << "/" << limit_overlay << "\n";
-
-        double t = frame_idx2 / fps;
-        cv::Mat blended = overlay_frame.clone();
-
-        // Draw displacement arrows on each centre ROI
-        double arrow_scale = 50.0;  // amplify sub-pixel displacement for visibility
-        int edge_margin = 3;
-
-        if (frame_idx2 < dic.fft_frames_out) {
-            for (int roi = 0; roi < dic.n_rois_out; roi++) {
-                int rc = roi % cols, rr = roi / cols;
-                if (rc < edge_margin || rc >= cols - edge_margin ||
-                    rr < edge_margin || rr >= rows - edge_margin) continue;
-
-                float dx = dic.frame_dx[roi * dic.fft_frames_out + frame_idx2];
-                float dy = dic.frame_dy[roi * dic.fft_frames_out + frame_idx2];
-                float mag = std::sqrt(dx * dx + dy * dy);
-
-                if (mag < 0.005) continue;  // skip zero displacement
-
-                // Arrow centre
-                int cx = rc * roi_size + roi_size / 2;
-                int cy = rr * roi_size + roi_size / 2;
-
-                // Arrow tip (amplified for visibility)
-                int tx = cx + static_cast<int>(dx * arrow_scale);
-                int ty = cy + static_cast<int>(dy * arrow_scale);
-
-                // Color by magnitude: green=small, yellow=medium, red=large
-                double norm_mag = std::min(1.0, static_cast<double>(mag) / vis_max_amp);
-                int r_val = static_cast<int>(255 * norm_mag);
-                int g_val = static_cast<int>(255 * (1.0 - norm_mag * 0.5));
-                int b_val = 0;
-                cv::Scalar color(b_val, g_val, r_val);
-
-                cv::arrowedLine(blended, cv::Point(cx, cy), cv::Point(tx, ty),
-                                color, 1, cv::LINE_AA, 0, 0.3);
-
-                // Small dot at ROI centre
-                cv::circle(blended, cv::Point(cx, cy), 2, color, -1);
-            }
-        }
-
-        // Add frequency labels only for centre-region vibration ROIs
-        for (const auto& r : results) {
-            int lrc = r.roi_x / roi_size, lrr = r.roi_y / roi_size;
-            if (lrc < 3 || lrc >= cols - 3 || lrr < 3 || lrr >= rows - 3) continue;
-            if (r.amplitude_px > vis_max_amp * 0.15 &&
-                r.dominant_freq_hz > 10.0 && r.dominant_freq_hz < 200.0 &&
-                r.amplitude_px < 2.0) {
-                char label[32];
-                snprintf(label, sizeof(label), "%.0fHz", r.dominant_freq_hz);
-                cv::putText(blended, label,
-                            cv::Point(r.roi_x + 2, r.roi_y + roi_size / 2 + 4),
-                            cv::FONT_HERSHEY_SIMPLEX, 0.3,
-                            cv::Scalar(255, 255, 255), 1);
-            }
-        }
-
-        // Info bar
-        cv::rectangle(blended, cv::Rect(0, 0, width, 35), cv::Scalar(0, 0, 0), -1);
-        char info[256];
-        snprintf(info, sizeof(info),
-                 "DIC Vibration | ROI: %dx%d | Rotor: %.1fHz | Amp: %.3fpx | t=%.3fs | Frame %d/%d",
-                 roi_size, roi_size, speckle_dom_freq, vis_max_amp, t, frame_idx2, limit_overlay);
-        cv::putText(blended, info, cv::Point(10, 22),
-                    cv::FONT_HERSHEY_SIMPLEX, 0.45, cv::Scalar(0, 255, 200), 1);
-
-        overlay_writer.write(blended);
-        frame_idx2++;
-    }
-
-    cap2.release();
-    overlay_writer.release();
-
-    std::cout << "Saved: " << output_dir << "/vibration_overlay.avi\n";
 
     return 0;
 }
