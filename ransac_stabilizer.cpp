@@ -38,7 +38,7 @@ static constexpr double HOMOGRAPHY_CONFIDENCE = 0.995;  // Higher confidence
 // Reference refresh: update reference when inlier ratio drops below this
 // to prevent match degradation as the scene drifts from frame 0.
 static constexpr double MIN_INLIER_RATIO = 0.10;
-static constexpr int    KEYFRAME_INTERVAL = 100;  // refresh keyframe every N frames
+static constexpr int    KEYFRAME_INTERVAL = 1000; // refresh keyframe every N frames (long enough to span camera-vibration cycles)
 static constexpr int    ROT_SMOOTH_N = 10;        // smooth rotation over N frames
 static constexpr int    REFRESH_INLIER_THRESHOLD = 60; // refresh if inliers < this
 
@@ -83,20 +83,21 @@ public:
         ref_set_ = true;
     }
 
+    // Additional region to exclude from the background flow sampling
+    // (e.g. vibrating rotor subject). Intersects any existing exclusions.
+    void setSubjectRegion(const cv::Rect& r) { subject_rect_ = r; }
+
     // Refine a RANSAC-stabilized frame: compute residual flow, correct
     // both translation AND rotation residuals.
+    // Reference is locked to frame 0 for the whole clip — no periodic refresh,
+    // because refreshing at an arbitrary phase of camera vibration bakes that
+    // phase into the zero and defeats low-frequency correction.
     cv::Mat refine(const cv::Mat& stabilized, double& residual_dx, double& residual_dy,
-                   int frame_idx = -1) {
+                   int /*frame_idx*/ = -1) {
         residual_dx = 0.0;
         residual_dy = 0.0;
 
         if (!ref_set_) {
-            setReference(stabilized);
-            return stabilized.clone();
-        }
-
-        // Refresh reference every 500 frames to prevent drift
-        if (frame_idx > 0 && frame_idx % 500 == 0) {
             setReference(stabilized);
             return stabilized.clone();
         }
@@ -114,7 +115,9 @@ public:
         cv::Mat flow;
         flow_gpu.download(flow);
 
-        // Build mask: exclude centre marker region + borders
+        // Build mask: exclude centre marker region, borders, and (if set)
+        // the vibrating subject region — otherwise the rigid fit absorbs
+        // some of the subject motion as "camera residual."
         if (bg_mask_.empty() || bg_mask_.size() != flow.size()) {
             bg_mask_ = cv::Mat::ones(flow.rows, flow.cols, CV_8U);
             int cx = flow.cols / 2, cy = flow.rows / 2;
@@ -126,6 +129,10 @@ public:
             bg_mask_(cv::Rect(0, flow.rows - 20, flow.cols, 20)) = 0;
             bg_mask_(cv::Rect(0, 0, 20, flow.rows)) = 0;
             bg_mask_(cv::Rect(flow.cols - 20, 0, 20, flow.rows)) = 0;
+            if (subject_rect_.area() > 0) {
+                cv::Rect s = subject_rect_ & cv::Rect(0, 0, flow.cols, flow.rows);
+                if (s.area() > 0) bg_mask_(s) = 0;
+            }
         }
 
         // Collect background flow samples WITH positions (for rotation estimation)
@@ -187,6 +194,7 @@ private:
     cv::Ptr<cv::cuda::FarnebackOpticalFlow> farneback_;
     cv::cuda::GpuMat ref_gray_gpu_;
     cv::Mat bg_mask_;
+    cv::Rect subject_rect_;
     bool ref_set_ = false;
 };
 
@@ -235,6 +243,8 @@ public:
         mask_built_ = false;
     }
 
+    void setSubjectRegion(const cv::Rect& r) { subject_rect_ = r; }
+
     void buildMask(int width, int height) {
         cv::Rect exclusion(
             width / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
@@ -242,7 +252,11 @@ public:
             ARUCO_SIZE + 2 * EXCLUSION_MARGIN,
             ARUCO_SIZE + 2 * EXCLUSION_MARGIN);
         cv::Mat mask_cpu = cv::Mat::ones(height, width, CV_8U) * 255;
-        mask_cpu(exclusion) = 0;
+        mask_cpu(exclusion & cv::Rect(0, 0, width, height)) = 0;
+        if (subject_rect_.area() > 0) {
+            cv::Rect s = subject_rect_ & cv::Rect(0, 0, width, height);
+            if (s.area() > 0) mask_cpu(s) = 0;
+        }
         mask_gpu_.upload(mask_cpu);
         mask_built_ = true;
     }
@@ -449,6 +463,7 @@ private:
     cv::aruco::Dictionary aruco_dict_;
     cv::aruco::ArucoDetector aruco_detector_;
     cv::cuda::GpuMat mask_gpu_;
+    cv::Rect subject_rect_;
     cv::cuda::Stream stream_;
 
     bool initialized_ = false;
@@ -627,9 +642,16 @@ void processDataset(const std::string& input_dir, const std::string& output_dir)
 //  Video input mode
 // ─────────────────────────────────────────────────────────────────────────────
 
-void processVideo(const std::string& video_path, const std::string& output_dir, int max_frames = 0) {
+void processVideo(const std::string& video_path, const std::string& output_dir,
+                  int max_frames = 0, cv::Rect subject_rect = cv::Rect()) {
     RansacStabilizer stabilizer;
     FarnebackRefinement farneback;
+    if (subject_rect.area() > 0) {
+        stabilizer.setSubjectRegion(subject_rect);
+        farneback.setSubjectRegion(subject_rect);
+        std::cout << "Subject mask: x=" << subject_rect.x << " y=" << subject_rect.y
+                  << " w=" << subject_rect.width << " h=" << subject_rect.height << "\n";
+    }
     fs::create_directories(output_dir);
 
     cv::VideoCapture cap(video_path);
@@ -711,9 +733,12 @@ static bool isVideoFile(const std::string& path) {
 
 int main(int argc, char* argv[]) {
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <input> <output_dir> [--frames N]\n";
-        std::cerr << "  input     : video file (.mp4/.avi/.mov) OR directory with frames/\n";
-        std::cerr << "  --frames N: process only first N frames (default: all)\n";
+        std::cerr << "Usage: " << argv[0] << " <input> <output_dir> [--frames N] [--subject-mask X,Y,W,H]\n";
+        std::cerr << "  input            : video file (.mp4/.avi/.mov) OR directory with frames/\n";
+        std::cerr << "  --frames N       : process only first N frames (default: all)\n";
+        std::cerr << "  --subject-mask   : exclude this rect from stabilizer feature sampling\n";
+        std::cerr << "                     (use for non-ArUco videos where the vibrating subject\n";
+        std::cerr << "                      would otherwise leak into the background transform)\n";
         return 1;
     }
 
@@ -721,9 +746,20 @@ int main(int argc, char* argv[]) {
     std::string output_dir = argv[2];
 
     int max_frames = 0;
+    cv::Rect subject_rect;
     for (int i = 3; i < argc - 1; i++) {
-        if (std::string(argv[i]) == "--frames")
+        std::string flag = argv[i];
+        if (flag == "--frames") {
             max_frames = std::stoi(argv[i + 1]);
+        } else if (flag == "--subject-mask") {
+            int x, y, w, h;
+            if (std::sscanf(argv[i + 1], "%d,%d,%d,%d", &x, &y, &w, &h) == 4) {
+                subject_rect = cv::Rect(x, y, w, h);
+            } else {
+                std::cerr << "Bad --subject-mask value (expected X,Y,W,H): " << argv[i + 1] << "\n";
+                return 1;
+            }
+        }
     }
 
     try {
@@ -732,7 +768,7 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Video not found: " << input << "\n";
                 return 1;
             }
-            processVideo(input, output_dir, max_frames);
+            processVideo(input, output_dir, max_frames, subject_rect);
         } else {
             if (!fs::exists(input + "/frames")) {
                 std::cerr << "Frames directory not found: " << input << "/frames\n";
