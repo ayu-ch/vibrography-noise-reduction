@@ -75,11 +75,9 @@ public:
         farneback_->setFlags(0);
     }
 
-    // Call once with the first stabilized frame to set the reference
-    void setReference(const cv::Mat& ref_frame) {
-        cv::Mat gray;
-        cv::cvtColor(ref_frame, gray, cv::COLOR_BGR2GRAY);
-        ref_gray_gpu_.upload(gray);
+    // Set reference from a GPU-side BGR frame (no CPU round-trip).
+    void setReferenceGpu(const cv::cuda::GpuMat& ref_gpu_bgr) {
+        cv::cuda::cvtColor(ref_gpu_bgr, ref_gray_gpu_, cv::COLOR_BGR2GRAY);
         ref_set_ = true;
     }
 
@@ -87,33 +85,41 @@ public:
     // (e.g. vibrating rotor subject). Intersects any existing exclusions.
     void setSubjectRegion(const cv::Rect& r) { subject_rect_ = r; }
 
-    // Refine a RANSAC-stabilized frame: compute residual flow, correct
-    // both translation AND rotation residuals.
+    // GPU-native refinement: takes the original frame + stage-1 stabilized
+    // frame (both on GPU) and the stage-1 transform H_smooth. Computes the
+    // residual correction H_corr from dense flow, composes H_final =
+    // H_corr * H_smooth, and applies ONE warp to the original frame.
+    //
+    // Benefits vs. the old cv::Mat refine():
+    //   * No intermediate download/upload of the stage-1 result.
+    //   * Single interpolation pass (composed warp) instead of two cascaded.
+    //   * Reuses preallocated cur_gray_gpu_/flow_gpu_/gpu_final_ buffers.
+    //
     // Reference is locked to frame 0 for the whole clip — no periodic refresh,
     // because refreshing at an arbitrary phase of camera vibration bakes that
     // phase into the zero and defeats low-frequency correction.
-    cv::Mat refine(const cv::Mat& stabilized, double& residual_dx, double& residual_dy,
-                   int /*frame_idx*/ = -1) {
+    cv::Mat refineComposed(const cv::cuda::GpuMat& gpu_frame_bgr,
+                           const cv::cuda::GpuMat& gpu_stabilized_bgr,
+                           const cv::Mat& H_smooth,
+                           double& residual_dx, double& residual_dy) {
         residual_dx = 0.0;
         residual_dy = 0.0;
 
         if (!ref_set_) {
-            setReference(stabilized);
-            return stabilized.clone();
+            setReferenceGpu(gpu_stabilized_bgr);
+            cv::Mat out;
+            gpu_stabilized_bgr.download(out);
+            return out;
         }
 
-        // Convert to gray and upload
-        cv::Mat gray;
-        cv::cvtColor(stabilized, gray, cv::COLOR_BGR2GRAY);
-        cv::cuda::GpuMat cur_gpu;
-        cur_gpu.upload(gray);
+        // Convert stabilized (stage-1) to gray on GPU — no CPU trip
+        cv::cuda::cvtColor(gpu_stabilized_bgr, cur_gray_gpu_, cv::COLOR_BGR2GRAY);
 
         // Dense optical flow on GPU
-        cv::cuda::GpuMat flow_gpu;
-        farneback_->calc(ref_gray_gpu_, cur_gpu, flow_gpu);
+        farneback_->calc(ref_gray_gpu_, cur_gray_gpu_, flow_gpu_);
 
-        cv::Mat flow;
-        flow_gpu.download(flow);
+        flow_gpu_.download(flow_cpu_);
+        cv::Mat& flow = flow_cpu_;
 
         // Build mask: exclude centre marker region, borders, and (if set)
         // the vibrating subject region — otherwise the rigid fit absorbs
@@ -152,27 +158,39 @@ public:
             }
         }
 
-        if (src_pts.size() < 10) return stabilized.clone();
+        // Fallback if we couldn't collect enough samples: just download stage-1
+        if (src_pts.size() < 10) {
+            cv::Mat out;
+            gpu_stabilized_bgr.download(out);
+            return out;
+        }
 
         // Fit rigid transform (translation + rotation) to the flow field
-        // This extracts both residual translation AND residual rotation
         cv::Mat rigid = cv::estimateAffinePartial2D(src_pts, dst_pts,
                                                      cv::noArray(), cv::RANSAC, 1.5);
 
-        if (rigid.empty()) return stabilized.clone();
+        if (rigid.empty()) {
+            cv::Mat out;
+            gpu_stabilized_bgr.download(out);
+            return out;
+        }
 
         double res_tx = rigid.at<double>(0, 2);
         double res_ty = rigid.at<double>(1, 2);
         residual_dx = res_tx;
         residual_dy = res_ty;
 
-        // Only correct if residual is above noise floor
+        // If residual is below noise floor, skip the composed warp and just
+        // return the stage-1 result (download only)
         double residual_mag = std::sqrt(res_tx*res_tx + res_ty*res_ty);
         double res_rot = std::atan2(rigid.at<double>(1, 0), rigid.at<double>(0, 0));
-        if (residual_mag < 0.02 && std::abs(res_rot) < 1e-5)
-            return stabilized.clone();
+        if (residual_mag < 0.02 && std::abs(res_rot) < 1e-5) {
+            cv::Mat out;
+            gpu_stabilized_bgr.download(out);
+            return out;
+        }
 
-        // Apply rigid correction (translation + rotation) on GPU
+        // Build H_corr (3x3) from the 2x3 rigid affine
         cv::Mat H_corr = cv::Mat::eye(3, 3, CV_64F);
         H_corr.at<double>(0, 0) = rigid.at<double>(0, 0);
         H_corr.at<double>(0, 1) = rigid.at<double>(0, 1);
@@ -181,18 +199,24 @@ public:
         H_corr.at<double>(1, 1) = rigid.at<double>(1, 1);
         H_corr.at<double>(1, 2) = rigid.at<double>(1, 2);
 
-        cv::cuda::GpuMat gpu_in, gpu_out;
-        gpu_in.upload(stabilized);
-        cv::cuda::warpPerspective(gpu_in, gpu_out, H_corr, stabilized.size(),
+        // Compose: final(x) = H_corr(H_smooth(x)) = (H_corr * H_smooth) * x
+        // One warp of the ORIGINAL frame replaces two cascaded warps.
+        cv::Mat H_final = H_corr * H_smooth;
+        cv::cuda::warpPerspective(gpu_frame_bgr, gpu_final_, H_final,
+                                  gpu_frame_bgr.size(),
                                   cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
         cv::Mat corrected;
-        gpu_out.download(corrected);
+        gpu_final_.download(corrected);
         return corrected;
     }
 
 private:
     cv::Ptr<cv::cuda::FarnebackOpticalFlow> farneback_;
     cv::cuda::GpuMat ref_gray_gpu_;
+    cv::cuda::GpuMat cur_gray_gpu_;   // reused each frame
+    cv::cuda::GpuMat flow_gpu_;       // reused
+    cv::cuda::GpuMat gpu_final_;      // reused
+    cv::Mat flow_cpu_;                // reused (gets overwritten each frame)
     cv::Mat bg_mask_;
     cv::Rect subject_rect_;
     bool ref_set_ = false;
@@ -268,27 +292,27 @@ public:
         if (!mask_built_)
             buildMask(frame.cols, frame.rows);
 
-        // ── 1. Upload to GPU and convert to gray ──────────────────────────
-        cv::cuda::GpuMat gpu_frame, gpu_gray;
-        gpu_frame.upload(frame);
-        cv::cuda::cvtColor(gpu_frame, gpu_gray, cv::COLOR_BGR2GRAY);
+        // ── 1. Upload to GPU and convert to gray (reused buffers) ─────────
+        gpu_frame_.upload(frame);
+        cv::cuda::cvtColor(gpu_frame_, gpu_gray_, cv::COLOR_BGR2GRAY);
 
         // ── 2. CUDA ORB detection ─────────────────────────────────────────
-        cv::cuda::GpuMat gpu_kps_mat, gpu_desc;
-        orb_gpu_->detectAndComputeAsync(gpu_gray, mask_gpu_,
-                                        gpu_kps_mat, gpu_desc, false, stream_);
+        orb_gpu_->detectAndComputeAsync(gpu_gray_, mask_gpu_,
+                                        gpu_kps_mat_, gpu_desc_, false, stream_);
         stream_.waitForCompletion();
 
         std::vector<cv::KeyPoint> kps;
-        orb_gpu_->convert(gpu_kps_mat, kps);
+        orb_gpu_->convert(gpu_kps_mat_, kps);
         m.keypoints_found = static_cast<int>(kps.size());
 
         if (!initialized_) {
             if (static_cast<int>(kps.size()) < MIN_MATCHES)
                 return frame.clone();
             keyframe_kps_ = kps;
-            keyframe_desc_gpu_ = gpu_desc.clone();
+            keyframe_desc_gpu_ = gpu_desc_.clone();
             H_accumulated_ = cv::Mat::eye(3, 3, CV_64F);
+            H_smooth_ = cv::Mat::eye(3, 3, CV_64F);
+            gpu_stabilized_ = gpu_frame_.clone();
             frames_since_keyframe_ = 0;
             initialized_ = true;
             return frame.clone();
@@ -302,7 +326,7 @@ public:
         cv::Mat H_to_kf;
         if (static_cast<int>(kps.size()) >= MIN_MATCHES) {
             std::vector<std::vector<cv::DMatch>> knn_matches;
-            matcher_gpu_->knnMatch(gpu_desc, keyframe_desc_gpu_, knn_matches, 2);
+            matcher_gpu_->knnMatch(gpu_desc_, keyframe_desc_gpu_, knn_matches, 2);
 
             std::vector<cv::DMatch> good_matches;
             for (const auto& pair : knn_matches) {
@@ -356,7 +380,7 @@ public:
             if (frames_since_keyframe_ >= KEYFRAME_INTERVAL) {
                 H_accumulated_ = H_total.clone();
                 keyframe_kps_ = kps;
-                keyframe_desc_gpu_ = gpu_desc.clone();
+                keyframe_desc_gpu_ = gpu_desc_.clone();
                 frames_since_keyframe_ = 0;
             }
         } else {
@@ -382,30 +406,41 @@ public:
         }
 
         // ── 6. Reconstruct smoothed H and apply warp ──────────────────────
+        // H_smooth_ and gpu_stabilized_ are cached as members so the
+        // Farneback stage can pick them up without re-uploading or
+        // re-downloading anything.
         cv::Mat stabilized;
         if (!H_total.empty()) {
             double theta_rad = m.rotation_deg * CV_PI / 180.0;
             double cos_t = m.scale * std::cos(theta_rad);
             double sin_t = m.scale * std::sin(theta_rad);
-            cv::Mat H_smooth = cv::Mat::eye(3, 3, CV_64F);
-            H_smooth.at<double>(0, 0) =  cos_t;
-            H_smooth.at<double>(0, 1) = -sin_t;
-            H_smooth.at<double>(0, 2) =  m.tx;
-            H_smooth.at<double>(1, 0) =  sin_t;
-            H_smooth.at<double>(1, 1) =  cos_t;
-            H_smooth.at<double>(1, 2) =  m.ty;
+            H_smooth_ = cv::Mat::eye(3, 3, CV_64F);
+            H_smooth_.at<double>(0, 0) =  cos_t;
+            H_smooth_.at<double>(0, 1) = -sin_t;
+            H_smooth_.at<double>(0, 2) =  m.tx;
+            H_smooth_.at<double>(1, 0) =  sin_t;
+            H_smooth_.at<double>(1, 1) =  cos_t;
+            H_smooth_.at<double>(1, 2) =  m.ty;
 
-            cv::cuda::GpuMat gpu_stabilized;
-            cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H_smooth, frame.size(),
-                                      cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
-            gpu_stabilized.download(stabilized);
+            cv::cuda::warpPerspective(gpu_frame_, gpu_stabilized_, H_smooth_,
+                                      frame.size(), cv::INTER_CUBIC,
+                                      cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+            gpu_stabilized_.download(stabilized);
         } else {
+            H_smooth_ = cv::Mat::eye(3, 3, CV_64F);
+            gpu_stabilized_ = gpu_frame_.clone();
             stabilized = frame.clone();
         }
 
         m.stabilization_ms = tickMs(cv::getTickCount() - t_start);
         return stabilized;
     }
+
+    // Accessors used by the Farneback refinement stage to avoid
+    // re-uploading the original frame and stage-1 stabilized result.
+    const cv::cuda::GpuMat& lastGpuFrame()       const { return gpu_frame_; }
+    const cv::cuda::GpuMat& lastGpuStabilized()  const { return gpu_stabilized_; }
+    const cv::Mat&          lastHSmooth()        const { return H_smooth_; }
 
     cv::Point2f detectArUcoCenter(const cv::Mat& frame, Metrics& m) {
         auto t_start = cv::getTickCount();
@@ -465,6 +500,14 @@ private:
     cv::cuda::GpuMat mask_gpu_;
     cv::Rect subject_rect_;
     cv::cuda::Stream stream_;
+
+    // Reused per-frame GPU buffers (preallocate → no per-frame cudaMalloc)
+    cv::cuda::GpuMat gpu_frame_;
+    cv::cuda::GpuMat gpu_gray_;
+    cv::cuda::GpuMat gpu_kps_mat_;
+    cv::cuda::GpuMat gpu_desc_;
+    cv::cuda::GpuMat gpu_stabilized_;  // stage-1 warp result (BGR)
+    cv::Mat H_smooth_;                 // stage-1 transform (3x3)
 
     bool initialized_ = false;
     bool mask_built_ = false;
@@ -699,8 +742,14 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
         RansacStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
 
-        // Stage 2: Farneback residual correction (translation + rotation)
-        stabilized = farneback.refine(stabilized, m.farneback_dx, m.farneback_dy, frame_idx);
+        // Stage 2: Farneback residual correction — GPU-native path.
+        // Reuses gpu_frame and gpu_stabilized from stage 1 (no re-upload)
+        // and composes a single final warp instead of cascading two.
+        stabilized = farneback.refineComposed(
+            stabilizer.lastGpuFrame(),
+            stabilizer.lastGpuStabilized(),
+            stabilizer.lastHSmooth(),
+            m.farneback_dx, m.farneback_dy);
 
         if (writer.isOpened()) writer.write(stabilized);
 
