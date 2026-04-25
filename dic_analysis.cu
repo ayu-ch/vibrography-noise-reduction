@@ -211,9 +211,12 @@ public:
         int total  = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
         int n_frames = std::min(total, max_frames);
 
-        // Round down to power of 2 for efficient FFT
-        int fft_frames = 1;
-        while (fft_frames * 2 <= n_frames) fft_frames *= 2;
+        // Use every available frame. cuFFT supports arbitrary sizes; it's
+        // fastest when the size factors into small primes (2, 3, 5, 7) and
+        // falls back to Bluestein's algorithm for other sizes — slower per
+        // FFT but still fine here because the temporal 1D FFT runs only
+        // twice (X and Y axes), not once per frame.
+        int fft_frames = n_frames;
 
         int cols = width / roi_size_;
         int rows = height / roi_size_;
@@ -605,7 +608,9 @@ int main(int argc, char* argv[]) {
     std::cout << "\n=== Summary ===\n";
     std::cout << "Dominant frequency: " << dom_freq << " Hz\n";
     std::cout << "Max amplitude: " << max_amp << " px\n";
-    std::cout << "Frequency resolution: " << fps / max_frames << " Hz\n";
+    // Note: actual frequency resolution depends on the number of frames
+    // actually used (printed in the DICAnalyzer header), which can be
+    // smaller than max_frames if the video is shorter.
 
     return 0;
 }
