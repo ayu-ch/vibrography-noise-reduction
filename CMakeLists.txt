@@ -45,12 +45,20 @@ endif()
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
     enable_language(CUDA)
+
     add_executable(dic_analysis dic_analysis.cu)
     target_link_libraries(dic_analysis ${OpenCV_LIBS} CUDA::cufft CUDA::cudart)
     set_target_properties(dic_analysis PROPERTIES CUDA_ARCHITECTURES "70")
     message(STATUS "CUDA toolkit found — building dic_analysis")
+
+    # Phase-correlation stabilizer (replaces ORB+RANSAC+Farneback chain)
+    add_executable(phase_stabilizer phase_stabilizer.cpp)
+    set_source_files_properties(phase_stabilizer.cpp PROPERTIES LANGUAGE CUDA)
+    target_link_libraries(phase_stabilizer ${OpenCV_LIBS} CUDA::cufft CUDA::cudart)
+    set_target_properties(phase_stabilizer PROPERTIES CUDA_ARCHITECTURES "70")
+    message(STATUS "Building phase_stabilizer")
 else()
-    message(STATUS "CUDA toolkit not found — skipping dic_analysis")
+    message(STATUS "CUDA toolkit not found — skipping dic_analysis / phase_stabilizer")
 endif()
 
 # Set default build type
