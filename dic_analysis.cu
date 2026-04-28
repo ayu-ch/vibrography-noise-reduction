@@ -95,10 +95,16 @@ __global__ void crossPowerSpectrumKernel(const cufftComplex* fft_ref,
     }
 }
 
-// Find sub-pixel peak in inverse FFT result (per ROI)
-// Uses 3-point parabolic interpolation around the peak
+// Find sub-pixel peak in inverse FFT result (per ROI), and scatter the result
+// directly into the per-ROI time-series buffer at the current frame slot.
+// Layout of all_dx / all_dy: [roi * fft_frames + frame_idx]
+//
+// Folding the scatter into this kernel removes the per-frame
+// d_dx/d_dy intermediate plus its host roundtrip — same numerics, no
+// CPU loop, no extra memcpy.
 __global__ void findSubPixelPeakKernel(const float* corr, int roi_size,
-                                        int n_rois, float* dx_out, float* dy_out) {
+                                        int n_rois, int frame_idx, int fft_frames,
+                                        float* all_dx, float* all_dy) {
     int roi_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (roi_idx >= n_rois) return;
 
@@ -139,8 +145,9 @@ __global__ void findSubPixelPeakKernel(const float* corr, int roi_size,
             iy += (top - bot) / denom;
     }
 
-    dx_out[roi_idx] = ix;
-    dy_out[roi_idx] = iy;
+    // Scatter into time-series buffer at this frame's slot
+    all_dx[roi_idx * fft_frames + frame_idx] = ix;
+    all_dy[roi_idx * fft_frames + frame_idx] = iy;
 }
 
 // Apply Hanning window to 1D displacement time series before spectral FFT
@@ -178,6 +185,28 @@ __global__ void subtractInPlaceKernel(float* a, const float* b, int n) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= n) return;
     a[idx] -= b[idx];
+}
+
+// GPU patch extraction. Reads from a CV_8U cv::cuda::GpuMat (with row step
+// in bytes) and writes float patches in batched layout.
+//   grid  = (cols, rows)              one block per ROI
+//   block = (256)                     threads cooperate to copy roi_size² pixels
+__global__ void extractPatchesKernel(const unsigned char* __restrict__ gray,
+                                     int gray_step, float* __restrict__ patches,
+                                     int roi_size, int cols /*unused*/) {
+    int rx = blockIdx.x;
+    int ry = blockIdx.y;
+    int roi_idx  = ry * gridDim.x + rx;
+    int n_pixels = roi_size * roi_size;
+    int px = rx * roi_size;
+    int py = ry * roi_size;
+    float* dst = patches + roi_idx * n_pixels;
+
+    for (int idx = threadIdx.x; idx < n_pixels; idx += blockDim.x) {
+        int y = idx / roi_size;
+        int x = idx - y * roi_size;
+        dst[idx] = float(gray[(py + y) * gray_step + (px + x)]);
+    }
 }
 
 
@@ -230,13 +259,18 @@ public:
         std::cout << "  FPS: " << fps_ << " → freq resolution: "
                   << fps_ / fft_frames << " Hz\n\n";
 
-        // ── Read frames and extract ROI patches ──────────────────────────
-        cv::Mat ref_gray;
-        std::vector<float> all_dx(n_rois * fft_frames, 0.0f);
-        std::vector<float> all_dy(n_rois * fft_frames, 0.0f);
+        // ── Set up GPU pipeline ──────────────────────────────────────────
+        // Per-frame patch extraction now runs on GPU (extractPatchesKernel)
+        // and the peak finder writes directly into d_disp_x / d_disp_y at
+        // the current frame's slot.  No host roundtrip per frame.
 
-        // Precompute 2D Hanning window for ROI
-        std::vector<float> hann2d(roi_size_ * roi_size_);
+        int roi_pixels = roi_size_ * roi_size_;
+        int fft_w = roi_size_ / 2 + 1;
+        int fft_complex_size = fft_w * roi_size_;
+        int spec_size = fft_frames / 2 + 1;
+
+        // Precompute 2D Hanning window for ROI patches
+        std::vector<float> hann2d(roi_pixels);
         for (int y = 0; y < roi_size_; y++) {
             float wy = 0.5f * (1.0f - std::cos(2.0 * M_PI * y / (roi_size_ - 1)));
             for (int x = 0; x < roi_size_; x++) {
@@ -245,24 +279,31 @@ public:
             }
         }
 
-        // GPU allocations for phase correlation
-        int roi_pixels = roi_size_ * roi_size_;
-        int fft_w = roi_size_ / 2 + 1;
-        int fft_complex_size = fft_w * roi_size_;
-
+        // Device buffers
         float *d_ref_patches, *d_cur_patches, *d_hann, *d_corr;
         cufftComplex *d_fft_ref, *d_fft_cur, *d_cross;
-        float *d_dx, *d_dy;
+        float *d_disp_x, *d_disp_y;
+        cufftComplex *d_spec_x, *d_spec_y;
 
         CUDA_CHECK(cudaMalloc(&d_ref_patches, n_rois * roi_pixels * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_cur_patches, n_rois * roi_pixels * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_hann, roi_pixels * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_corr, n_rois * roi_pixels * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_hann,                roi_pixels * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_corr,        n_rois * roi_pixels * sizeof(float)));
         CUDA_CHECK(cudaMalloc(&d_fft_ref, n_rois * fft_complex_size * sizeof(cufftComplex)));
         CUDA_CHECK(cudaMalloc(&d_fft_cur, n_rois * fft_complex_size * sizeof(cufftComplex)));
-        CUDA_CHECK(cudaMalloc(&d_cross, n_rois * fft_complex_size * sizeof(cufftComplex)));
-        CUDA_CHECK(cudaMalloc(&d_dx, n_rois * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_dy, n_rois * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_cross,   n_rois * fft_complex_size * sizeof(cufftComplex)));
+
+        // Time-series buffers — allocated once, written into per-frame.
+        // cudaMemset 0 so frame 0's slot stays 0 (frame 0 is the reference,
+        // never goes through the peak finder).
+        CUDA_CHECK(cudaMalloc(&d_disp_x, n_rois * fft_frames * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_disp_y, n_rois * fft_frames * sizeof(float)));
+        CUDA_CHECK(cudaMemset( d_disp_x, 0, n_rois * fft_frames * sizeof(float)));
+        CUDA_CHECK(cudaMemset( d_disp_y, 0, n_rois * fft_frames * sizeof(float)));
+
+        // Spectrum buffers (used after the per-frame loop)
+        CUDA_CHECK(cudaMalloc(&d_spec_x, n_rois * spec_size * sizeof(cufftComplex)));
+        CUDA_CHECK(cudaMalloc(&d_spec_y, n_rois * spec_size * sizeof(cufftComplex)));
 
         CUDA_CHECK(cudaMemcpy(d_hann, hann2d.data(), roi_pixels * sizeof(float),
                               cudaMemcpyHostToDevice));
@@ -280,27 +321,37 @@ public:
                                    CUFFT_C2R, n_rois));
 
         int threads = 256;
+        dim3 patch_grid(cols, rows);
+
+        cv::cuda::GpuMat gpu_frame, gpu_gray;
 
         for (int frame_idx = 0; frame_idx < fft_frames; frame_idx++) {
             if (frame_idx % 100 == 0)
                 std::cout << "  Phase correlation: frame " << frame_idx << "/" << fft_frames << "\n";
 
-            cv::Mat frame, gray;
+            cv::Mat frame;
             if (!cap.read(frame)) break;
-            cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+            // Upload + grayscale on GPU.  Skip the CPU cvtColor + cv::Mat
+            // pixel-by-pixel reads that the old extractPatches did.
+            gpu_frame.upload(frame);
+            cv::cuda::cvtColor(gpu_frame, gpu_gray, cv::COLOR_BGR2GRAY);
 
             if (frame_idx == 0) {
-                ref_gray = gray.clone();
-                // Extract reference patches and FFT them
-                extractPatches(ref_gray, d_ref_patches, cols, rows);
+                // Reference frame: extract patches → Hanning → forward FFT once
+                extractPatchesKernel<<<patch_grid, threads>>>(
+                    gpu_gray.ptr<unsigned char>(), int(gpu_gray.step),
+                    d_ref_patches, roi_size_, cols);
                 applyHanningKernel<<<(n_rois * roi_pixels + threads - 1) / threads, threads>>>(
                     d_ref_patches, d_hann, roi_size_, n_rois);
                 CUFFT_CHECK(cufftExecR2C(plan_fwd, d_ref_patches, d_fft_ref));
                 continue;
             }
 
-            // Extract current patches, apply Hanning, FFT
-            extractPatches(gray, d_cur_patches, cols, rows);
+            // Extract current patches (GPU), Hanning, forward FFT
+            extractPatchesKernel<<<patch_grid, threads>>>(
+                gpu_gray.ptr<unsigned char>(), int(gpu_gray.step),
+                d_cur_patches, roi_size_, cols);
             applyHanningKernel<<<(n_rois * roi_pixels + threads - 1) / threads, threads>>>(
                 d_cur_patches, d_hann, roi_size_, n_rois);
             CUFFT_CHECK(cufftExecR2C(plan_fwd, d_cur_patches, d_fft_cur));
@@ -313,19 +364,11 @@ public:
             // Inverse FFT → correlation surface
             CUFFT_CHECK(cufftExecC2R(plan_inv, d_cross, d_corr));
 
-            // Find sub-pixel peak per ROI
+            // Find sub-pixel peak per ROI and scatter into the time-series
+            // buffers at this frame's slot.  No download per frame.
             findSubPixelPeakKernel<<<(n_rois + threads - 1) / threads, threads>>>(
-                d_corr, roi_size_, n_rois, d_dx, d_dy);
-
-            // Download displacements
-            std::vector<float> dx(n_rois), dy(n_rois);
-            CUDA_CHECK(cudaMemcpy(dx.data(), d_dx, n_rois * sizeof(float), cudaMemcpyDeviceToHost));
-            CUDA_CHECK(cudaMemcpy(dy.data(), d_dy, n_rois * sizeof(float), cudaMemcpyDeviceToHost));
-
-            for (int i = 0; i < n_rois; i++) {
-                all_dx[i * fft_frames + frame_idx] = dx[i];
-                all_dy[i * fft_frames + frame_idx] = dy[i];
-            }
+                d_corr, roi_size_, n_rois, frame_idx, fft_frames,
+                d_disp_x, d_disp_y);
         }
 
         cufftDestroy(plan_fwd);
@@ -334,22 +377,8 @@ public:
 
         std::cout << "\n  Spectral analysis (cuFFT batch)...\n";
 
-        // ── Batch FFT of displacement time series ────────────────────────
-        // For each ROI, FFT the displacement time series to get vibration spectrum
-        float *d_disp_x, *d_disp_y;
-        cufftComplex *d_spec_x, *d_spec_y;
-        int spec_size = fft_frames / 2 + 1;
-
-        CUDA_CHECK(cudaMalloc(&d_disp_x, n_rois * fft_frames * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_disp_y, n_rois * fft_frames * sizeof(float)));
-        CUDA_CHECK(cudaMalloc(&d_spec_x, n_rois * spec_size * sizeof(cufftComplex)));
-        CUDA_CHECK(cudaMalloc(&d_spec_y, n_rois * spec_size * sizeof(cufftComplex)));
-
-        // Upload raw displacement time series to GPU
-        CUDA_CHECK(cudaMemcpy(d_disp_x, all_dx.data(),
-                              n_rois * fft_frames * sizeof(float), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(d_disp_y, all_dy.data(),
-                              n_rois * fft_frames * sizeof(float), cudaMemcpyHostToDevice));
+        // d_disp_x / d_disp_y already populated on device from the per-frame
+        // peak kernel — no host upload needed here.
 
         // ── High-pass filter on GPU: subtract moving average ─────────────
         // The ~2Hz camera drift dominates the raw displacement signal.
@@ -442,13 +471,16 @@ public:
             float cx = spec_x[roi * spec_size + max_bin].x;
             float cy_val = spec_x[roi * spec_size + max_bin].y;
 
+            // Frame 0 is the reference (no peak finding done for it), so its
+            // slot is 0 in the time-series buffers — same as the previous
+            // host-side all_dx[roi*fft_frames] and all_dy[roi*fft_frames].
             results[roi] = {
                 rx, ry,
                 is_border ? 0.0 : max_bin * freq_resolution,
                 is_border ? 0.0 : max_mag / fft_frames,
                 std::atan2(cy_val, cx),
-                all_dx[roi * fft_frames],
-                all_dy[roi * fft_frames]
+                0.0,    // mean_dx (was always 0 — frame-0 slot)
+                0.0     // mean_dy
             };
         }
 
@@ -456,7 +488,6 @@ public:
         cudaFree(d_ref_patches); cudaFree(d_cur_patches);
         cudaFree(d_hann); cudaFree(d_corr);
         cudaFree(d_fft_ref); cudaFree(d_fft_cur); cudaFree(d_cross);
-        cudaFree(d_dx); cudaFree(d_dy);
         cudaFree(d_disp_x); cudaFree(d_disp_y);
         cudaFree(d_spec_x); cudaFree(d_spec_y);
 
@@ -464,29 +495,6 @@ public:
     }
 
 private:
-    void extractPatches(const cv::Mat& gray, float* d_patches, int cols, int rows) {
-        int n_rois = cols * rows;
-        int roi_pixels = roi_size_ * roi_size_;
-        std::vector<float> patches(n_rois * roi_pixels);
-
-        for (int ry = 0; ry < rows; ry++) {
-            for (int rx = 0; rx < cols; rx++) {
-                int roi_idx = ry * cols + rx;
-                int px = rx * roi_size_;
-                int py = ry * roi_size_;
-                for (int y = 0; y < roi_size_; y++) {
-                    for (int x = 0; x < roi_size_; x++) {
-                        patches[roi_idx * roi_pixels + y * roi_size_ + x] =
-                            static_cast<float>(gray.at<uchar>(py + y, px + x));
-                    }
-                }
-            }
-        }
-
-        CUDA_CHECK(cudaMemcpy(d_patches, patches.data(),
-                              n_rois * roi_pixels * sizeof(float), cudaMemcpyHostToDevice));
-    }
-
     int roi_size_;
     double fps_;
 };
