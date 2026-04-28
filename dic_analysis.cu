@@ -19,6 +19,8 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudacodec.hpp>          // NVDEC hardware video decoder
+#include <opencv2/core/cuda_stream_accessor.hpp>
 #include <cuda_runtime.h>
 #include <cufft.h>
 #include <iostream>
@@ -58,16 +60,6 @@ namespace fs = std::filesystem;
 //  CUDA Kernels
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Apply Hanning window to a batch of ROI patches
-__global__ void applyHanningKernel(float* data, const float* hann,
-                                    int roi_size, int n_rois) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = n_rois * roi_size * roi_size;
-    if (idx >= total) return;
-
-    int pixel_in_roi = idx % (roi_size * roi_size);
-    data[idx] *= hann[pixel_in_roi];
-}
 
 // Compute cross-power spectrum: (F1 * conj(F2)) / |F1 * conj(F2)|
 __global__ void crossPowerSpectrumKernel(const cufftComplex* fft_ref,
@@ -187,13 +179,18 @@ __global__ void subtractInPlaceKernel(float* a, const float* b, int n) {
     a[idx] -= b[idx];
 }
 
-// GPU patch extraction. Reads from a CV_8U cv::cuda::GpuMat (with row step
-// in bytes) and writes float patches in batched layout.
+// Fused patch extraction + Hanning window.
+// Reads from a CV_8U cv::cuda::GpuMat (with row step in bytes), converts to
+// float, and multiplies by the precomputed 2D Hanning window — all in one
+// kernel launch / one pass over the data.  Replaces the old
+// extractPatchesKernel + applyHanningKernel pair.
 //   grid  = (cols, rows)              one block per ROI
-//   block = (256)                     threads cooperate to copy roi_size² pixels
-__global__ void extractPatchesKernel(const unsigned char* __restrict__ gray,
-                                     int gray_step, float* __restrict__ patches,
-                                     int roi_size, int cols /*unused*/) {
+//   block = 256                        threads cooperate to copy roi_size² pixels
+__global__ void extractAndWindowKernel(const unsigned char* __restrict__ gray,
+                                       int gray_step,
+                                       const float* __restrict__ hann,
+                                       float* __restrict__ patches,
+                                       int roi_size) {
     int rx = blockIdx.x;
     int ry = blockIdx.y;
     int roi_idx  = ry * gridDim.x + rx;
@@ -205,7 +202,7 @@ __global__ void extractPatchesKernel(const unsigned char* __restrict__ gray,
     for (int idx = threadIdx.x; idx < n_pixels; idx += blockDim.x) {
         int y = idx / roi_size;
         int x = idx - y * roi_size;
-        dst[idx] = float(gray[(py + y) * gray_step + (px + x)]);
+        dst[idx] = float(gray[(py + y) * gray_step + (px + x)]) * hann[idx];
     }
 }
 
@@ -229,16 +226,30 @@ public:
 
     // Process stabilized video: extract vibration spectrum for each ROI
     std::vector<ROIResult> analyze(const std::string& video_path, int max_frames = 512) {
-        cv::VideoCapture cap(video_path);
-        if (!cap.isOpened()) {
+        // Pull frame count + resolution via cv::VideoCapture (cheap; doesn't
+        // decode anything beyond the header).  Actual decoding happens via
+        // NVDEC below.
+        cv::VideoCapture meta_cap(video_path);
+        if (!meta_cap.isOpened()) {
             std::cerr << "Cannot open: " << video_path << "\n";
             return {};
         }
-
-        int width  = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-        int height = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
-        int total  = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
+        int width  = static_cast<int>(meta_cap.get(cv::CAP_PROP_FRAME_WIDTH));
+        int height = static_cast<int>(meta_cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+        int total  = static_cast<int>(meta_cap.get(cv::CAP_PROP_FRAME_COUNT));
+        meta_cap.release();
         int n_frames = std::min(total, max_frames);
+
+        // NVDEC hardware decoder — frames decoded directly into device memory,
+        // no CPU MJPEG decode, no CPU→GPU upload.
+        cv::Ptr<cv::cudacodec::VideoReader> reader;
+        try {
+            reader = cv::cudacodec::createVideoReader(video_path);
+        } catch (const cv::Exception& e) {
+            std::cerr << "NVDEC unavailable (" << e.what() << ").  "
+                      << "Build OpenCV with -DWITH_NVCUVID=ON.\n";
+            return {};
+        }
 
         // Use every available frame. cuFFT supports arbitrary sizes; it's
         // fastest when the size factors into small primes (2, 3, 5, 7) and
@@ -308,7 +319,8 @@ public:
         CUDA_CHECK(cudaMemcpy(d_hann, hann2d.data(), roi_pixels * sizeof(float),
                               cudaMemcpyHostToDevice));
 
-        // Create batched 2D FFT plans
+        // Create batched 2D FFT plans, bound to the compute stream so cuFFT
+        // dispatches asynchronously alongside our custom kernels.
         int dims[2] = {roi_size_, roi_size_};
         cufftHandle plan_fwd, plan_inv;
         CUFFT_CHECK(cufftPlanMany(&plan_fwd, 2, dims,
@@ -320,60 +332,97 @@ public:
                                    NULL, 1, roi_pixels,
                                    CUFFT_C2R, n_rois));
 
+        // Two CUDA streams: one for NVDEC decode, one for compute.
+        // While stream B does FFT/cross-power/IFFT/peak on frame N, stream A
+        // decodes frame N+1 in parallel.  Effective per-frame cost ≈
+        // max(decode, compute) instead of sum.
+        cv::cuda::Stream s_decode, s_compute;
+        cudaStream_t cs_compute = cv::cuda::StreamAccessor::getStream(s_compute);
+        CUFFT_CHECK(cufftSetStream(plan_fwd, cs_compute));
+        CUFFT_CHECK(cufftSetStream(plan_inv, cs_compute));
+
         int threads = 256;
         dim3 patch_grid(cols, rows);
 
-        cv::cuda::GpuMat gpu_frame, gpu_gray;
+        // Double-buffered input frames so decode of frame N+1 can overlap
+        // with compute of frame N.
+        cv::cuda::GpuMat gpu_frame[2], gpu_gray[2];
 
-        for (int frame_idx = 0; frame_idx < fft_frames; frame_idx++) {
+        // ── Reference frame (frame 0): synchronous, sets d_fft_ref ──────
+        if (!reader->nextFrame(gpu_frame[0], s_decode)) {
+            std::cerr << "Cannot decode first frame\n";
+            return {};
+        }
+        s_decode.waitForCompletion();
+
+        cv::cuda::cvtColor(gpu_frame[0], gpu_gray[0], cv::COLOR_BGRA2GRAY,
+                           0, s_compute);
+        extractAndWindowKernel<<<patch_grid, threads, 0, cs_compute>>>(
+            gpu_gray[0].ptr<unsigned char>(), int(gpu_gray[0].step),
+            d_hann, d_ref_patches, roi_size_);
+        CUFFT_CHECK(cufftExecR2C(plan_fwd, d_ref_patches, d_fft_ref));
+        s_compute.waitForCompletion();
+
+        // Pre-decode frame 1 to prime the pipeline
+        if (fft_frames > 1) {
+            reader->nextFrame(gpu_frame[1], s_decode);
+        }
+
+        for (int frame_idx = 1; frame_idx < fft_frames; frame_idx++) {
             if (frame_idx % 100 == 0)
-                std::cout << "  Phase correlation: frame " << frame_idx << "/" << fft_frames << "\n";
+                std::cout << "  Phase correlation: frame " << frame_idx
+                          << "/" << fft_frames << "\n";
 
-            cv::Mat frame;
-            if (!cap.read(frame)) break;
+            int cur_buf = frame_idx & 1;        // current compute buffer
+            int nxt_buf = 1 - cur_buf;          // next decode buffer
 
-            // Upload + grayscale on GPU.  Skip the CPU cvtColor + cv::Mat
-            // pixel-by-pixel reads that the old extractPatches did.
-            gpu_frame.upload(frame);
-            cv::cuda::cvtColor(gpu_frame, gpu_gray, cv::COLOR_BGR2GRAY);
+            // Wait for current frame's decode to finish (was started last iter)
+            s_decode.waitForCompletion();
 
-            if (frame_idx == 0) {
-                // Reference frame: extract patches → Hanning → forward FFT once
-                extractPatchesKernel<<<patch_grid, threads>>>(
-                    gpu_gray.ptr<unsigned char>(), int(gpu_gray.step),
-                    d_ref_patches, roi_size_, cols);
-                applyHanningKernel<<<(n_rois * roi_pixels + threads - 1) / threads, threads>>>(
-                    d_ref_patches, d_hann, roi_size_, n_rois);
-                CUFFT_CHECK(cufftExecR2C(plan_fwd, d_ref_patches, d_fft_ref));
-                continue;
+            // Start decoding the next frame in parallel with compute
+            if (frame_idx + 1 < fft_frames) {
+                if (!reader->nextFrame(gpu_frame[nxt_buf], s_decode)) {
+                    // Stream ended early — drop the rest of the loop
+                    fft_frames = frame_idx + 1;
+                }
             }
 
-            // Extract current patches (GPU), Hanning, forward FFT
-            extractPatchesKernel<<<patch_grid, threads>>>(
-                gpu_gray.ptr<unsigned char>(), int(gpu_gray.step),
-                d_cur_patches, roi_size_, cols);
-            applyHanningKernel<<<(n_rois * roi_pixels + threads - 1) / threads, threads>>>(
-                d_cur_patches, d_hann, roi_size_, n_rois);
+            // Compute pipeline on s_compute (sequential within stream)
+            cv::cuda::cvtColor(gpu_frame[cur_buf], gpu_gray[cur_buf],
+                               cv::COLOR_BGRA2GRAY, 0, s_compute);
+            extractAndWindowKernel<<<patch_grid, threads, 0, cs_compute>>>(
+                gpu_gray[cur_buf].ptr<unsigned char>(),
+                int(gpu_gray[cur_buf].step),
+                d_hann, d_cur_patches, roi_size_);
             CUFFT_CHECK(cufftExecR2C(plan_fwd, d_cur_patches, d_fft_cur));
 
-            // Cross-power spectrum
             int total_complex = n_rois * fft_complex_size;
-            crossPowerSpectrumKernel<<<(total_complex + threads - 1) / threads, threads>>>(
+            crossPowerSpectrumKernel<<<(total_complex + threads - 1) / threads,
+                                       threads, 0, cs_compute>>>(
                 d_fft_ref, d_fft_cur, d_cross, total_complex);
 
-            // Inverse FFT → correlation surface
             CUFFT_CHECK(cufftExecC2R(plan_inv, d_cross, d_corr));
 
             // Find sub-pixel peak per ROI and scatter into the time-series
             // buffers at this frame's slot.  No download per frame.
-            findSubPixelPeakKernel<<<(n_rois + threads - 1) / threads, threads>>>(
+            findSubPixelPeakKernel<<<(n_rois + threads - 1) / threads,
+                                     threads, 0, cs_compute>>>(
                 d_corr, roi_size_, n_rois, frame_idx, fft_frames,
                 d_disp_x, d_disp_y);
+
+            // Compute must finish before this iter's gpu_gray buffer can be
+            // overwritten by the next decode (two iterations later, when
+            // cur_buf comes around again).  In practice the cuFFT plans
+            // serialise on s_compute so only the final wait is needed.
         }
+
+        // Drain both streams before moving to the spectral stage
+        s_decode.waitForCompletion();
+        s_compute.waitForCompletion();
 
         cufftDestroy(plan_fwd);
         cufftDestroy(plan_inv);
-        cap.release();
+        reader.release();
 
         std::cout << "\n  Spectral analysis (cuFFT batch)...\n";
 
