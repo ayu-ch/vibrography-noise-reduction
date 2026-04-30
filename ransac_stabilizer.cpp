@@ -30,7 +30,9 @@ static constexpr int ARUCO_SIZE = 150;
 static constexpr int EXCLUSION_MARGIN = 40;
 
 // ── Refined Parameters for Sub-pixel Accuracy ───────────────────────────────
-static constexpr int   ORB_FEATURES   = 5000;   // More features for stability
+// 2500 features: with quality-weighted top-60% selection still yields
+// 500–1000 inliers — the affine fit is well-determined.  Cuts ORB cost ~2×.
+static constexpr int   ORB_FEATURES   = 2500;
 static constexpr float LOWE_RATIO     = 0.65f;  // Tighter ratio test (was 0.7)
 static constexpr double RANSAC_THRESH = 3.0;    // Wider threshold for larger displacement
 static constexpr int   MIN_MATCHES    = 25;     // More matches required
@@ -41,6 +43,17 @@ static constexpr double MIN_INLIER_RATIO = 0.10;
 static constexpr int    KEYFRAME_INTERVAL = 1000; // refresh keyframe every N frames (long enough to span camera-vibration cycles)
 static constexpr int    ROT_SMOOTH_N = 10;        // smooth rotation over N frames
 static constexpr int    REFRESH_INLIER_THRESHOLD = 60; // refresh if inliers < this
+// Subject mask is expanded by this fraction on every side ("halo") so the
+// rectangle's corners don't graze the rotor disk.  Pure mask geometry —
+// doesn't filter any frequency band.
+static constexpr double SUBJECT_HALO_FRAC = 0.10;
+// Keep top fraction of Lowe-passing matches by Harris response; high-response
+// keypoints are more localizable, so the affine fit is sharper.  Independent
+// ranking — does not filter frequencies.
+static constexpr double MATCH_QUALITY_KEEP = 0.60;
+// Auto-disable ArUco if no marker is found in the first N frames (rotor
+// videos have no marker, saves ~0.5–1 ms/frame).
+static constexpr int    ARUCO_PROBE_FRAMES = 100;
 
 
 struct DisplacementData {
@@ -269,6 +282,11 @@ public:
 
     void setSubjectRegion(const cv::Rect& r) { subject_rect_ = r; }
 
+    // Video mode pipes the stage-1 result through Farneback which always
+    // downloads its own output — so the download inside stabilize() is
+    // wasted work.  Set this once in video mode to keep stage-1 result on GPU.
+    void setSkipDownload(bool v) { skip_download_ = v; }
+
     void buildMask(int width, int height) {
         cv::Rect exclusion(
             width / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
@@ -278,7 +296,14 @@ public:
         cv::Mat mask_cpu = cv::Mat::ones(height, width, CV_8U) * 255;
         mask_cpu(exclusion & cv::Rect(0, 0, width, height)) = 0;
         if (subject_rect_.area() > 0) {
-            cv::Rect s = subject_rect_ & cv::Rect(0, 0, width, height);
+            // Halo: expand the rect by 10% on every side so its corners
+            // don't graze rotor pixels.
+            int hx = static_cast<int>(subject_rect_.width  * SUBJECT_HALO_FRAC);
+            int hy = static_cast<int>(subject_rect_.height * SUBJECT_HALO_FRAC);
+            cv::Rect s(subject_rect_.x - hx, subject_rect_.y - hy,
+                       subject_rect_.width  + 2 * hx,
+                       subject_rect_.height + 2 * hy);
+            s &= cv::Rect(0, 0, width, height);
             if (s.area() > 0) mask_cpu(s) = 0;
         }
         mask_gpu_.upload(mask_cpu);
@@ -334,6 +359,25 @@ public:
                     good_matches.push_back(pair[0]);
             }
             m.good_matches = static_cast<int>(good_matches.size());
+
+            // Rank Lowe-passing matches by combined Harris response and keep
+            // the top MATCH_QUALITY_KEEP fraction.  High-response keypoints
+            // are more localizable → less sub-pixel jitter in the fit.
+            if (m.good_matches > MIN_MATCHES) {
+                std::sort(good_matches.begin(), good_matches.end(),
+                          [&](const cv::DMatch& a, const cv::DMatch& b) {
+                    float ra = kps[a.queryIdx].response +
+                               keyframe_kps_[a.trainIdx].response;
+                    float rb = kps[b.queryIdx].response +
+                               keyframe_kps_[b.trainIdx].response;
+                    return ra > rb;
+                });
+                int keep = std::max(MIN_MATCHES,
+                                    static_cast<int>(good_matches.size() *
+                                                     MATCH_QUALITY_KEEP));
+                good_matches.resize(keep);
+                m.good_matches = keep;
+            }
 
             if (m.good_matches >= MIN_MATCHES) {
                 std::vector<cv::Point2f> src_pts, dst_pts;
@@ -425,11 +469,11 @@ public:
             cv::cuda::warpPerspective(gpu_frame_, gpu_stabilized_, H_smooth_,
                                       frame.size(), cv::INTER_CUBIC,
                                       cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
-            gpu_stabilized_.download(stabilized);
+            if (!skip_download_) gpu_stabilized_.download(stabilized);
         } else {
             H_smooth_ = cv::Mat::eye(3, 3, CV_64F);
             gpu_stabilized_ = gpu_frame_.clone();
-            stabilized = frame.clone();
+            if (!skip_download_) stabilized = frame.clone();
         }
 
         m.stabilization_ms = tickMs(cv::getTickCount() - t_start);
@@ -511,6 +555,7 @@ private:
 
     bool initialized_ = false;
     bool mask_built_ = false;
+    bool skip_download_ = false;
     int frames_since_keyframe_ = 0;
     std::vector<cv::KeyPoint> keyframe_kps_;
     cv::cuda::GpuMat keyframe_desc_gpu_;
@@ -688,6 +733,7 @@ void processDataset(const std::string& input_dir, const std::string& output_dir)
 void processVideo(const std::string& video_path, const std::string& output_dir,
                   int max_frames = 0, cv::Rect subject_rect = cv::Rect()) {
     RansacStabilizer stabilizer;
+    stabilizer.setSkipDownload(true);
     FarnebackRefinement farneback;
     if (subject_rect.area() > 0) {
         stabilizer.setSubjectRegion(subject_rect);
@@ -735,6 +781,12 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
     cv::Mat frame;
 
     int limit = (max_frames > 0) ? max_frames : total_frames;
+
+    // ArUco auto-disable: probe first ARUCO_PROBE_FRAMES frames; if no marker
+    // ever shows up, skip the cornerSubPix detector for the rest of the clip.
+    bool aruco_active = true;
+    int  aruco_hits   = 0;
+
     while (cap.read(frame) && frame_idx < limit) {
         if (frame_idx % 100 == 0)
             std::cout << "Frame " << frame_idx << "/" << limit << "\n";
@@ -753,7 +805,15 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
 
         if (writer.isOpened()) writer.write(stabilized);
 
-        cv::Point2f center = stabilizer.detectArUcoCenter(stabilized, m);
+        if (aruco_active) {
+            stabilizer.detectArUcoCenter(stabilized, m);
+            if (m.aruco_detected) aruco_hits++;
+            if (frame_idx + 1 >= ARUCO_PROBE_FRAMES && aruco_hits == 0) {
+                aruco_active = false;
+                std::cout << "  ArUco: no marker in first " << ARUCO_PROBE_FRAMES
+                          << " frames — disabling detector\n";
+            }
+        }
 
         csv << frame_idx << ","
             << m.tx << "," << m.ty << ","
