@@ -17,6 +17,7 @@
 #include <opencv2/aruco.hpp>
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/cudaimgproc.hpp>
+#include <opencv2/cudaarithm.hpp>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -99,6 +100,97 @@ private:
 
 
 // ─────────────────────────────────────────────────────────────────────────────
+//  GPU Phase Correlator — replaces cv::phaseCorrelate (CPU FFT) with cuFFT-
+//  backed cv::cuda::dft + cross-power spectrum + IFFT + peak find.
+//
+//  All buffers are preallocated on first frame; per-frame cost is dominated
+//  by the two DFTs (~0.5 ms total at 800×1080) plus a tiny H2D peak download.
+// ─────────────────────────────────────────────────────────────────────────────
+class GpuPhaseCorrelator {
+public:
+    void initialize(int W, int H) {
+        W_ = W;
+        H_ = H;
+        cv::Mat hann_cpu;
+        cv::createHanningWindow(hann_cpu, cv::Size(W, H), CV_32F);
+        hann_gpu_.upload(hann_cpu);
+    }
+
+    // ref must be CV_8UC1 on GPU
+    void setReferenceGpu(const cv::cuda::GpuMat& ref_gray) {
+        applyWindow(ref_gray, ref_w_);
+        cv::cuda::dft(ref_w_, F_ref_, cv::Size(W_, H_));
+        ref_set_ = true;
+    }
+
+    // Returns sub-pixel translation (cur → ref convention, matches
+    // cv::phaseCorrelate sign).  cur must be CV_8UC1 on GPU.
+    cv::Point2d compute(const cv::cuda::GpuMat& cur_gray) {
+        if (!ref_set_) return cv::Point2d(0, 0);
+
+        applyWindow(cur_gray, cur_w_);
+        cv::cuda::dft(cur_w_, F_cur_, cv::Size(W_, H_));
+
+        // Cross-power spectrum: F_ref * conj(F_cur)
+        cv::cuda::mulSpectrums(F_ref_, F_cur_, C_, 0, true);
+
+        // Normalize so |C(u,v)| = 1 (the "phase" part of phase correlation).
+        // Split into Re/Im channels, divide each by magnitude.
+        std::vector<cv::cuda::GpuMat> ch;
+        cv::cuda::split(C_, ch);
+        cv::cuda::magnitude(ch[0], ch[1], mag_);
+        cv::cuda::add(mag_, cv::Scalar(1e-10f), mag_);
+        cv::cuda::divide(ch[0], mag_, ch[0]);
+        cv::cuda::divide(ch[1], mag_, ch[1]);
+        cv::cuda::merge(ch, C_);
+
+        // Inverse DFT → real correlation surface
+        cv::cuda::dft(C_, corr_, cv::Size(W_, H_),
+                      cv::DFT_INVERSE | cv::DFT_REAL_OUTPUT | cv::DFT_SCALE);
+
+        // Find integer peak on GPU
+        cv::Point max_loc;
+        double max_val;
+        cv::cuda::minMaxLoc(corr_, nullptr, &max_val, nullptr, &max_loc);
+
+        // Sub-pixel parabolic refinement: fetch the 3×3 neighbourhood of
+        // the peak in one tiny D2H copy, then interpolate on CPU.
+        double dx = (max_loc.x > W_ / 2) ? max_loc.x - W_ : max_loc.x;
+        double dy = (max_loc.y > H_ / 2) ? max_loc.y - H_ : max_loc.y;
+
+        if (max_loc.x > 0 && max_loc.x < W_ - 1 &&
+            max_loc.y > 0 && max_loc.y < H_ - 1) {
+            cv::Mat patch;
+            corr_(cv::Rect(max_loc.x - 1, max_loc.y - 1, 3, 3)).download(patch);
+            float c  = patch.at<float>(1, 1);
+            float l  = patch.at<float>(1, 0);
+            float r  = patch.at<float>(1, 2);
+            float t  = patch.at<float>(0, 1);
+            float b  = patch.at<float>(2, 1);
+            float dxn = 2.0f * (2.0f * c - l - r);
+            float dyn = 2.0f * (2.0f * c - t - b);
+            if (std::fabs(dxn) > 1e-10f) dx += (l - r) / dxn;
+            if (std::fabs(dyn) > 1e-10f) dy += (t - b) / dyn;
+        }
+
+        return cv::Point2d(dx, dy);
+    }
+
+private:
+    void applyWindow(const cv::cuda::GpuMat& gray_8u, cv::cuda::GpuMat& dst) {
+        gray_8u.convertTo(gray_f_, CV_32F, 1.0 / 255.0);
+        cv::cuda::multiply(gray_f_, hann_gpu_, dst);
+    }
+
+    int W_ = 0, H_ = 0;
+    cv::cuda::GpuMat hann_gpu_;
+    cv::cuda::GpuMat gray_f_, ref_w_, cur_w_;
+    cv::cuda::GpuMat F_ref_, F_cur_, C_, corr_, mag_;
+    bool ref_set_ = false;
+};
+
+
+// ─────────────────────────────────────────────────────────────────────────────
 //  Phase Correlation Stabilizer
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -152,16 +244,17 @@ public:
     cv::Mat stabilize(const cv::Mat& frame, Metrics& m, RLPolicy* policy) {
         auto t_start = cv::getTickCount();
 
-        cv::Mat gray;
-        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+        // Upload + GPU cvtColor (preallocated buffers — no per-frame alloc)
+        gpu_frame_.upload(frame);
+        cv::cuda::cvtColor(gpu_frame_, gpu_gray_, cv::COLOR_BGR2GRAY);
 
         // ── 1. Initialize reference on first frame ────────────────────────
         if (!initialized_) {
-            ref_gray_ = gray.clone();
-            ref_gray_64f_ = gray.clone();
-            ref_gray_64f_.convertTo(ref_gray_64f_, CV_64F);
-            hann_ = cv::Mat();
-            cv::createHanningWindow(hann_, gray.size(), CV_64F);
+            corr_.initialize(frame.cols, frame.rows);
+            corr_.setReferenceGpu(gpu_gray_);
+            // GPU + CPU copies of the reference for the policy's observation.
+            gpu_ref_gray_ = gpu_gray_.clone();
+            gpu_gray_.download(ref_gray_);
             initialized_ = true;
             frame_count_ = 0;
             return frame.clone();
@@ -169,13 +262,8 @@ public:
 
         frame_count_++;
 
-        // ── 2. Phase correlation (sub-pixel translation) ──────────────────
-        cv::Mat cur_64f;
-        gray.convertTo(cur_64f, CV_64F);
-
-        cv::Point2d shift = cv::phaseCorrelate(
-            ref_gray_64f_.mul(hann_), cur_64f.mul(hann_));
-
+        // ── 2. Phase correlation on GPU (cuFFT) ──────────────────────────
+        cv::Point2d shift = corr_.compute(gpu_gray_);
         m.phase_dx = shift.x;
         m.phase_dy = shift.y;
 
@@ -183,30 +271,36 @@ public:
         double act_tx, act_ty, act_theta, act_scale;
 
         if (policy) {
-            // Compute frame difference (translation-removed)
-            cv::Mat shifted_gray = gray.clone();
+            // Frame difference (translation-removed) on GPU.
+            cv::cuda::GpuMat shifted_gpu;
             if (std::abs(shift.x) > 0.01 || std::abs(shift.y) > 0.01) {
                 cv::Mat M_shift = (cv::Mat_<float>(2, 3) <<
                     1, 0, static_cast<float>(-shift.x),
                     0, 1, static_cast<float>(-shift.y));
-                cv::warpAffine(gray, shifted_gray, M_shift, gray.size());
+                cv::cuda::warpAffine(gpu_gray_, shifted_gpu, M_shift, gpu_gray_.size(),
+                                     cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0));
+            } else {
+                shifted_gpu = gpu_gray_;
             }
-            cv::Mat diff;
-            cv::absdiff(ref_gray_, shifted_gray, diff);
+
+            // Absdiff on GPU; only download the small DIFF_W×DIFF_H tile we need.
+            cv::cuda::GpuMat diff_gpu, diff_small_gpu;
+            cv::cuda::absdiff(gpu_ref_gray_, shifted_gpu, diff_gpu);
+            cv::cuda::resize(diff_gpu, diff_small_gpu, cv::Size(DIFF_W, DIFF_H),
+                             0, 0, cv::INTER_AREA);
             cv::Mat diff_small;
-            cv::resize(diff, diff_small, cv::Size(DIFF_W, DIFF_H), 0, 0, cv::INTER_AREA);
+            diff_small_gpu.download(diff_small);
             diff_small.convertTo(diff_small, CV_32F);
             float diff_max = *std::max_element(diff_small.begin<float>(), diff_small.end<float>());
             if (diff_max > 0) diff_small /= diff_max;
 
-            // Patch stats
-            int cx = gray.cols / 2, cy = gray.rows / 2;
+            // Patch stats — small CPU op on the cached ref Mat.
+            int cx = ref_gray_.cols / 2, cy = ref_gray_.rows / 2;
             int r = 16;
             cv::Rect patch_roi(cx - r, cy - r, r * 2, r * 2);
-            patch_roi &= cv::Rect(0, 0, gray.cols, gray.rows);
-            cv::Mat ref_patch = ref_gray_(patch_roi);
+            patch_roi &= cv::Rect(0, 0, ref_gray_.cols, ref_gray_.rows);
             cv::Scalar ref_mean, ref_std;
-            cv::meanStdDev(ref_patch, ref_mean, ref_std);
+            cv::meanStdDev(ref_gray_(patch_roi), ref_mean, ref_std);
 
             cv::Mat diff_centre = diff_small(cv::Rect(
                 DIFF_W / 2 - 2, DIFF_H / 2 - 2, 4, 4));
@@ -271,12 +365,11 @@ public:
         H.at<double>(1, 1) =  cos_t;
         H.at<double>(1, 2) =  act_ty;
 
-        cv::Mat stabilized;
-        cv::cuda::GpuMat gpu_frame, gpu_stabilized;
-        gpu_frame.upload(frame);
-        cv::cuda::warpPerspective(gpu_frame, gpu_stabilized, H, frame.size(),
+        // Reuse the gpu_frame_ already uploaded at the top of this call.
+        cv::cuda::warpPerspective(gpu_frame_, gpu_stabilized_, H, frame.size(),
                                   cv::INTER_CUBIC, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
-        gpu_stabilized.download(stabilized);
+        cv::Mat stabilized;
+        gpu_stabilized_.download(stabilized);
 
         m.stabilization_ms = static_cast<double>(cv::getTickCount() - t_start) /
                              cv::getTickFrequency() * 1000.0;
@@ -322,10 +415,16 @@ private:
 
     bool initialized_ = false;
     int frame_count_ = 0;
-    cv::Mat ref_gray_;
-    cv::Mat ref_gray_64f_;
-    cv::Mat hann_;
+    cv::Mat ref_gray_;                    // CPU copy of ref (used for patch stats)
     std::array<float, 4> prev_delta_ = {0, 0, 0, 0};
+
+    // Preallocated GPU buffers reused every frame.
+    cv::cuda::GpuMat gpu_frame_;          // BGR upload
+    cv::cuda::GpuMat gpu_gray_;           // CV_8UC1 grayscale
+    cv::cuda::GpuMat gpu_ref_gray_;       // CV_8UC1 reference
+    cv::cuda::GpuMat gpu_stabilized_;     // BGR warp output
+
+    GpuPhaseCorrelator corr_;
 };
 
 
@@ -383,6 +482,12 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
 
     double total_ms = 0;
 
+    // ArUco auto-disable: probe first 100 frames; if no marker shows up,
+    // skip the (expensive) cornerSubPix detector for the rest of the clip.
+    constexpr int ARUCO_PROBE_FRAMES = 100;
+    bool aruco_active = true;
+    int  aruco_hits   = 0;
+
     while (cap.read(frame) && frame_idx < limit) {
         if (frame_idx % 100 == 0)
             std::cout << "Frame " << frame_idx << "/" << limit << "\n";
@@ -392,7 +497,15 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
 
         if (writer.isOpened()) writer.write(stabilized);
 
-        stabilizer.detectArUcoCenter(stabilized, m);
+        if (aruco_active) {
+            stabilizer.detectArUcoCenter(stabilized, m);
+            if (m.aruco_detected) aruco_hits++;
+            if (frame_idx + 1 >= ARUCO_PROBE_FRAMES && aruco_hits == 0) {
+                aruco_active = false;
+                std::cout << "  ArUco: no marker in first " << ARUCO_PROBE_FRAMES
+                          << " frames — disabling detector\n";
+            }
+        }
 
         csv << frame_idx << ","
             << m.phase_dx << "," << m.phase_dy << ","
