@@ -5,6 +5,7 @@
 #include <opencv2/cudawarping.hpp>
 #include <opencv2/cudaimgproc.hpp>
 #include <opencv2/cudaoptflow.hpp>
+#include <opencv2/cudacodec.hpp>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -12,6 +13,7 @@
 #include <numeric>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
@@ -98,6 +100,12 @@ public:
     // (e.g. vibrating rotor subject). Intersects any existing exclusions.
     void setSubjectRegion(const cv::Rect& r) { subject_rect_ = r; }
 
+    // NVENC path: skip the final cv::Mat download.  Caller reads the
+    // result GpuMat via lastGpuOutput() and passes it directly to the
+    // NVENC writer.
+    void setSkipDownload(bool v) { skip_download_ = v; }
+    const cv::cuda::GpuMat& lastGpuOutput() const { return last_output_; }
+
     // GPU-native refinement: takes the original frame + stage-1 stabilized
     // frame (both on GPU) and the stage-1 transform H_smooth. Computes the
     // residual correction H_corr from dense flow, composes H_final =
@@ -120,8 +128,9 @@ public:
 
         if (!ref_set_) {
             setReferenceGpu(gpu_stabilized_bgr);
+            last_output_ = gpu_stabilized_bgr;
             cv::Mat out;
-            gpu_stabilized_bgr.download(out);
+            if (!skip_download_) gpu_stabilized_bgr.download(out);
             return out;
         }
 
@@ -173,8 +182,9 @@ public:
 
         // Fallback if we couldn't collect enough samples: just download stage-1
         if (src_pts.size() < 10) {
+            last_output_ = gpu_stabilized_bgr;
             cv::Mat out;
-            gpu_stabilized_bgr.download(out);
+            if (!skip_download_) gpu_stabilized_bgr.download(out);
             return out;
         }
 
@@ -183,8 +193,9 @@ public:
                                                      cv::noArray(), cv::RANSAC, 1.5);
 
         if (rigid.empty()) {
+            last_output_ = gpu_stabilized_bgr;
             cv::Mat out;
-            gpu_stabilized_bgr.download(out);
+            if (!skip_download_) gpu_stabilized_bgr.download(out);
             return out;
         }
 
@@ -198,8 +209,9 @@ public:
         double residual_mag = std::sqrt(res_tx*res_tx + res_ty*res_ty);
         double res_rot = std::atan2(rigid.at<double>(1, 0), rigid.at<double>(0, 0));
         if (residual_mag < 0.02 && std::abs(res_rot) < 1e-5) {
+            last_output_ = gpu_stabilized_bgr;
             cv::Mat out;
-            gpu_stabilized_bgr.download(out);
+            if (!skip_download_) gpu_stabilized_bgr.download(out);
             return out;
         }
 
@@ -218,8 +230,9 @@ public:
         cv::cuda::warpPerspective(gpu_frame_bgr, gpu_final_, H_final,
                                   gpu_frame_bgr.size(),
                                   cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0,0,0));
+        last_output_ = gpu_final_;
         cv::Mat corrected;
-        gpu_final_.download(corrected);
+        if (!skip_download_) gpu_final_.download(corrected);
         return corrected;
     }
 
@@ -232,7 +245,11 @@ private:
     cv::Mat flow_cpu_;                // reused (gets overwritten each frame)
     cv::Mat bg_mask_;
     cv::Rect subject_rect_;
+    cv::cuda::GpuMat last_output_;    // shallow ref to whichever GpuMat is the
+                                       // current frame's output (gpu_stabilized_
+                                       // or gpu_final_).  For NVENC writer.
     bool ref_set_ = false;
+    bool skip_download_ = false;
 };
 
 
@@ -287,6 +304,11 @@ public:
     // wasted work.  Set this once in video mode to keep stage-1 result on GPU.
     void setSkipDownload(bool v) { skip_download_ = v; }
 
+    // NVDEC path: caller has already filled gpu_frame_ with BGR data on GPU,
+    // so stabilize() must not re-upload from the cv::Mat argument.
+    void setSkipUpload(bool v) { skip_upload_ = v; }
+    cv::cuda::GpuMat& mutableGpuFrame() { return gpu_frame_; }
+
     void buildMask(int width, int height) {
         cv::Rect exclusion(
             width / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
@@ -318,7 +340,7 @@ public:
             buildMask(frame.cols, frame.rows);
 
         // ── 1. Upload to GPU and convert to gray (reused buffers) ─────────
-        gpu_frame_.upload(frame);
+        if (!skip_upload_) gpu_frame_.upload(frame);
         cv::cuda::cvtColor(gpu_frame_, gpu_gray_, cv::COLOR_BGR2GRAY);
 
         // ── 2. CUDA ORB detection ─────────────────────────────────────────
@@ -556,6 +578,7 @@ private:
     bool initialized_ = false;
     bool mask_built_ = false;
     bool skip_download_ = false;
+    bool skip_upload_ = false;
     int frames_since_keyframe_ = 0;
     std::vector<cv::KeyPoint> keyframe_kps_;
     cv::cuda::GpuMat keyframe_desc_gpu_;
@@ -743,21 +766,42 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
     }
     fs::create_directories(output_dir);
 
-    cv::VideoCapture cap(video_path);
-    if (!cap.isOpened()) {
+    // Pull metadata via cv::VideoCapture (cheap; header-only).
+    cv::VideoCapture meta_cap(video_path);
+    if (!meta_cap.isOpened()) {
         std::cerr << "Cannot open video: " << video_path << "\n";
         return;
     }
+    int total_frames = static_cast<int>(meta_cap.get(cv::CAP_PROP_FRAME_COUNT));
+    double fps       = meta_cap.get(cv::CAP_PROP_FPS);
+    int width        = static_cast<int>(meta_cap.get(cv::CAP_PROP_FRAME_WIDTH));
+    int height       = static_cast<int>(meta_cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    meta_cap.release();
 
-    int total_frames = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_COUNT));
-    double fps       = cap.get(cv::CAP_PROP_FPS);
-    int width        = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_WIDTH));
-    int height       = static_cast<int>(cap.get(cv::CAP_PROP_FRAME_HEIGHT));
+    // Try NVDEC first.  Falls back to CPU decode for codecs NVDEC can't
+    // handle (e.g. raw uncompressed AVI).
+    cv::Ptr<cv::cudacodec::VideoReader> nvdec_reader;
+    bool use_nvdec = true;
+    try {
+        nvdec_reader = cv::cudacodec::createVideoReader(video_path);
+    } catch (const cv::Exception&) {
+        use_nvdec = false;
+    }
+    cv::VideoCapture cap;
+    if (!use_nvdec) {
+        cap.open(video_path);
+        if (!cap.isOpened()) {
+            std::cerr << "Cannot open video for CPU decode: " << video_path << "\n";
+            return;
+        }
+    }
 
-    std::cout << "RANSAC Stabilizer — Video Mode\n";
+    std::cout << "RANSAC Stabilizer — Video Mode " << (use_nvdec ? "(NVDEC)" : "(CPU)") << "\n";
     std::cout << "Input  : " << video_path << "\n";
     std::cout << "Frames : " << total_frames << " @ " << fps << " fps, "
               << width << "x" << height << "\n\n";
+
+    if (use_nvdec) stabilizer.setSkipUpload(true);
 
     std::ofstream csv(output_dir + "/compensation.csv");
     csv << "frame_id,tx_px,ty_px,rotation_deg,scale,"
@@ -765,21 +809,31 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
            "farneback_dx,farneback_dy,"
            "aruco_detected,aruco_center_x,aruco_center_y\n";
 
-    cv::VideoWriter writer(
-        output_dir + "/stabilized.avi",
-        cv::VideoWriter::fourcc('M', 'J', 'P', 'G'),
-        fps, cv::Size(width, height));
-    if (!writer.isOpened()) {
-        std::cerr << "Warning: VideoWriter failed, trying raw AVI...\n";
-        writer.open(output_dir + "/stabilized.avi", 0, 30.0, cv::Size(width, height));
+    // Try NVENC writer first (H.264-in-AVI); fall back to CPU MJPEG.
+    cv::Ptr<cv::cudacodec::VideoWriter> nvenc_writer;
+    cv::VideoWriter cpu_writer;
+    bool use_nvenc = true;
+    try {
+        nvenc_writer = cv::cudacodec::createVideoWriter(
+            output_dir + "/stabilized.avi",
+            cv::Size(width, height),
+            cv::cudacodec::Codec::H264,
+            fps > 0 ? fps : 1000.0,
+            cv::cudacodec::ColorFormat::BGR);
+    } catch (const cv::Exception&) {
+        use_nvenc = false;
     }
-    if (!writer.isOpened()) {
-        std::cerr << "Warning: Could not open VideoWriter. Frames will be saved as PNGs only.\n";
+    if (!use_nvenc) {
+        cpu_writer.open(output_dir + "/stabilized.avi",
+                        cv::VideoWriter::fourcc('M','J','P','G'),
+                        fps, cv::Size(width, height));
+        if (!cpu_writer.isOpened()) {
+            std::cerr << "Warning: CPU VideoWriter failed too — no video output.\n";
+        }
     }
+    std::cout << "Encoder: " << (use_nvenc ? "NVENC (H.264)" : "CPU (MJPEG)") << "\n";
 
     int frame_idx = 0;
-    cv::Mat frame;
-
     int limit = (max_frames > 0) ? max_frames : total_frames;
 
     // ArUco auto-disable: probe first ARUCO_PROBE_FRAMES frames; if no marker
@@ -787,12 +841,54 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
     bool aruco_active = true;
     int  aruco_hits   = 0;
 
-    while (cap.read(frame) && frame_idx < limit) {
+    // CPU-decode path: pipeline reads in a worker thread so frame N+1's
+    // decode overlaps with frame N's GPU compute.
+    auto read_next = [&]() -> std::pair<bool, cv::Mat> {
+        cv::Mat f;
+        bool ok = cap.read(f);
+        return {ok, std::move(f)};
+    };
+    std::future<std::pair<bool, cv::Mat>> prefetch;
+    if (!use_nvdec) prefetch = std::async(std::launch::async, read_next);
+
+    // NVDEC path: dummy host header (no allocation needed for stabilize's
+    // size queries since skip_upload bypasses the data access).
+    cv::Mat nvdec_dummy(height, width, CV_8UC3);
+    cv::cuda::GpuMat gpu_bgra;
+
+    while (frame_idx < limit) {
+        cv::Mat frame;
+        bool has_frame = false;
+
+        if (use_nvdec) {
+            if (nvdec_reader->nextFrame(gpu_bgra)) {
+                cv::cuda::cvtColor(gpu_bgra, stabilizer.mutableGpuFrame(),
+                                   cv::COLOR_BGRA2BGR);
+                frame = nvdec_dummy;   // header only — stabilize uses size, not data
+                has_frame = true;
+            }
+        } else {
+            auto pair = prefetch.get();
+            has_frame = pair.first;
+            if (has_frame) {
+                frame = std::move(pair.second);
+                if (frame_idx + 1 < limit)
+                    prefetch = std::async(std::launch::async, read_next);
+            }
+        }
+        if (!has_frame) break;
+
         if (frame_idx % 100 == 0)
             std::cout << "Frame " << frame_idx << "/" << limit << "\n";
 
         RansacStabilizer::Metrics m;
         cv::Mat stabilized = stabilizer.stabilize(frame, m);
+
+        // We can skip the final cv::Mat download whenever both:
+        //   1. The writer is NVENC (consumes GpuMat directly), and
+        //   2. ArUco is no longer probing (CPU detector needs cv::Mat).
+        // While ArUco is probing the first 100 frames, keep downloading.
+        farneback.setSkipDownload(use_nvenc && !aruco_active);
 
         // Stage 2: Farneback residual correction — GPU-native path.
         // Reuses gpu_frame and gpu_stabilized from stage 1 (no re-upload)
@@ -803,7 +899,11 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
             stabilizer.lastHSmooth(),
             m.farneback_dx, m.farneback_dy);
 
-        if (writer.isOpened()) writer.write(stabilized);
+        if (use_nvenc) {
+            nvenc_writer->write(farneback.lastGpuOutput());
+        } else if (cpu_writer.isOpened()) {
+            cpu_writer.write(stabilized);
+        }
 
         if (aruco_active) {
             stabilizer.detectArUcoCenter(stabilized, m);
@@ -827,8 +927,10 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
         frame_idx++;
     }
 
-    cap.release();
-    writer.release();
+    if (use_nvdec) nvdec_reader.release();
+    else           cap.release();
+    if (use_nvenc) nvenc_writer.release();
+    else           cpu_writer.release();
     std::cout << "\nProcessed " << frame_idx << " frames\n";
     std::cout << "Stabilized video → " << output_dir << "/stabilized.avi\n";
 }
