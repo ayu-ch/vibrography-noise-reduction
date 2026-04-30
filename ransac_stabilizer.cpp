@@ -36,7 +36,12 @@ static constexpr int EXCLUSION_MARGIN = 40;
 // 500–1000 inliers — the affine fit is well-determined.  Cuts ORB cost ~2×.
 static constexpr int   ORB_FEATURES   = 2500;
 static constexpr float LOWE_RATIO     = 0.65f;  // Tighter ratio test (was 0.7)
-static constexpr double RANSAC_THRESH = 3.0;    // Wider threshold for larger displacement
+// Stabilizer runs at half resolution internally (4× fewer pixels →
+// ~3-5 ms saved on ORB+Farneback) and the warp is applied at full res.
+// All translation outputs from the half-res affine fit get multiplied by
+// HALF_RES_SCALE before being used in the full-resolution warp.
+static constexpr int   HALF_RES_SCALE = 2;
+static constexpr double RANSAC_THRESH = 1.5;    // 3.0 / HALF_RES_SCALE — same physical tolerance
 static constexpr int   MIN_MATCHES    = 25;     // More matches required
 static constexpr double HOMOGRAPHY_CONFIDENCE = 0.995;  // Higher confidence
 // Reference refresh: update reference when inlier ratio drops below this
@@ -91,8 +96,10 @@ public:
     }
 
     // Set reference from a GPU-side BGR frame (no CPU round-trip).
+    // Reference is stored at half-res — Farneback always runs half-res.
     void setReferenceGpu(const cv::cuda::GpuMat& ref_gpu_bgr) {
-        cv::cuda::cvtColor(ref_gpu_bgr, ref_gray_gpu_, cv::COLOR_BGR2GRAY);
+        cv::cuda::pyrDown(ref_gpu_bgr, ref_half_bgr_);
+        cv::cuda::cvtColor(ref_half_bgr_, ref_gray_gpu_, cv::COLOR_BGR2GRAY);
         ref_set_ = true;
     }
 
@@ -134,8 +141,11 @@ public:
             return out;
         }
 
-        // Convert stabilized (stage-1) to gray on GPU — no CPU trip
-        cv::cuda::cvtColor(gpu_stabilized_bgr, cur_gray_gpu_, cv::COLOR_BGR2GRAY);
+        // Downsample stage-1 stabilized → half-res gray.  Farneback runs
+        // at half resolution: same physical accuracy on rigid camera drift,
+        // 4× fewer pixels.
+        cv::cuda::pyrDown(gpu_stabilized_bgr, cur_half_bgr_);
+        cv::cuda::cvtColor(cur_half_bgr_, cur_gray_gpu_, cv::COLOR_BGR2GRAY);
 
         // Dense optical flow on GPU
         farneback_->calc(ref_gray_gpu_, cur_gray_gpu_, flow_gpu_);
@@ -143,14 +153,12 @@ public:
         flow_gpu_.download(flow_cpu_);
         cv::Mat& flow = flow_cpu_;
 
-        // Build mask: exclude centre marker region, borders, and (if set)
-        // the vibrating subject region — otherwise the rigid fit absorbs
-        // some of the subject motion as "camera residual."
+        // Build mask at half-res — flow is half-res so the mask must be too.
         if (bg_mask_.empty() || bg_mask_.size() != flow.size()) {
             bg_mask_ = cv::Mat::ones(flow.rows, flow.cols, CV_8U);
             int cx = flow.cols / 2, cy = flow.rows / 2;
-            int half = (ARUCO_SIZE + 2 * EXCLUSION_MARGIN) / 2;
-            cv::Rect roi(cx - half, cy - half, half * 2, half * 2);
+            int half_excl = ((ARUCO_SIZE + 2 * EXCLUSION_MARGIN) / HALF_RES_SCALE) / 2;
+            cv::Rect roi(cx - half_excl, cy - half_excl, half_excl * 2, half_excl * 2);
             roi &= cv::Rect(0, 0, flow.cols, flow.rows);
             bg_mask_(roi) = 0;
             bg_mask_(cv::Rect(0, 0, flow.cols, 20)) = 0;
@@ -158,8 +166,13 @@ public:
             bg_mask_(cv::Rect(0, 0, 20, flow.rows)) = 0;
             bg_mask_(cv::Rect(flow.cols - 20, 0, 20, flow.rows)) = 0;
             if (subject_rect_.area() > 0) {
-                cv::Rect s = subject_rect_ & cv::Rect(0, 0, flow.cols, flow.rows);
-                if (s.area() > 0) bg_mask_(s) = 0;
+                // subject_rect_ is full-res — convert to half-res for the mask.
+                cv::Rect s_half(subject_rect_.x / HALF_RES_SCALE,
+                                subject_rect_.y / HALF_RES_SCALE,
+                                subject_rect_.width  / HALF_RES_SCALE,
+                                subject_rect_.height / HALF_RES_SCALE);
+                s_half &= cv::Rect(0, 0, flow.cols, flow.rows);
+                if (s_half.area() > 0) bg_mask_(s_half) = 0;
             }
         }
 
@@ -188,9 +201,11 @@ public:
             return out;
         }
 
-        // Fit rigid transform (translation + rotation) to the flow field
+        // Fit rigid transform (translation + rotation) to the flow field.
+        // Threshold halved (1.5/HALF_RES_SCALE = 0.75) to keep equivalent
+        // physical inlier tolerance vs the full-res baseline.
         cv::Mat rigid = cv::estimateAffinePartial2D(src_pts, dst_pts,
-                                                     cv::noArray(), cv::RANSAC, 1.5);
+                                                     cv::noArray(), cv::RANSAC, 0.75);
 
         if (rigid.empty()) {
             last_output_ = gpu_stabilized_bgr;
@@ -199,8 +214,11 @@ public:
             return out;
         }
 
-        double res_tx = rigid.at<double>(0, 2);
-        double res_ty = rigid.at<double>(1, 2);
+        // Scale translation from half-res to full-res; rotation/scale unchanged.
+        double res_tx = rigid.at<double>(0, 2) * HALF_RES_SCALE;
+        double res_ty = rigid.at<double>(1, 2) * HALF_RES_SCALE;
+        rigid.at<double>(0, 2) = res_tx;
+        rigid.at<double>(1, 2) = res_ty;
         residual_dx = res_tx;
         residual_dy = res_ty;
 
@@ -238,12 +256,14 @@ public:
 
 private:
     cv::Ptr<cv::cuda::FarnebackOpticalFlow> farneback_;
-    cv::cuda::GpuMat ref_gray_gpu_;
-    cv::cuda::GpuMat cur_gray_gpu_;   // reused each frame
-    cv::cuda::GpuMat flow_gpu_;       // reused
-    cv::cuda::GpuMat gpu_final_;      // reused
+    cv::cuda::GpuMat ref_half_bgr_;   // half-res reference BGR
+    cv::cuda::GpuMat cur_half_bgr_;   // half-res current BGR (per frame)
+    cv::cuda::GpuMat ref_gray_gpu_;   // half-res ref gray
+    cv::cuda::GpuMat cur_gray_gpu_;   // half-res cur gray
+    cv::cuda::GpuMat flow_gpu_;       // half-res flow
+    cv::cuda::GpuMat gpu_final_;      // FULL-res warp output
     cv::Mat flow_cpu_;                // reused (gets overwritten each frame)
-    cv::Mat bg_mask_;
+    cv::Mat bg_mask_;                 // half-res mask
     cv::Rect subject_rect_;
     cv::cuda::GpuMat last_output_;    // shallow ref to whichever GpuMat is the
                                        // current frame's output (gpu_stabilized_
@@ -310,23 +330,28 @@ public:
     cv::cuda::GpuMat& mutableGpuFrame() { return gpu_frame_; }
 
     void buildMask(int width, int height) {
+        // Build at HALF resolution — that's where ORB runs.  The stabilizer
+        // never references the full-res mask, so we don't need to keep it.
+        int hw = width  / HALF_RES_SCALE;
+        int hh = height / HALF_RES_SCALE;
         cv::Rect exclusion(
-            width / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
-            height / 2 - ARUCO_SIZE / 2 - EXCLUSION_MARGIN,
-            ARUCO_SIZE + 2 * EXCLUSION_MARGIN,
-            ARUCO_SIZE + 2 * EXCLUSION_MARGIN);
-        cv::Mat mask_cpu = cv::Mat::ones(height, width, CV_8U) * 255;
-        mask_cpu(exclusion & cv::Rect(0, 0, width, height)) = 0;
+            hw / 2 - (ARUCO_SIZE / HALF_RES_SCALE) / 2 - EXCLUSION_MARGIN / HALF_RES_SCALE,
+            hh / 2 - (ARUCO_SIZE / HALF_RES_SCALE) / 2 - EXCLUSION_MARGIN / HALF_RES_SCALE,
+            (ARUCO_SIZE + 2 * EXCLUSION_MARGIN) / HALF_RES_SCALE,
+            (ARUCO_SIZE + 2 * EXCLUSION_MARGIN) / HALF_RES_SCALE);
+        cv::Mat mask_cpu = cv::Mat::ones(hh, hw, CV_8U) * 255;
+        mask_cpu(exclusion & cv::Rect(0, 0, hw, hh)) = 0;
         if (subject_rect_.area() > 0) {
-            // Halo: expand the rect by 10% on every side so its corners
-            // don't graze rotor pixels.
+            // Subject rect is in full-res coords — convert to half-res with halo.
             int hx = static_cast<int>(subject_rect_.width  * SUBJECT_HALO_FRAC);
             int hy = static_cast<int>(subject_rect_.height * SUBJECT_HALO_FRAC);
             cv::Rect s(subject_rect_.x - hx, subject_rect_.y - hy,
                        subject_rect_.width  + 2 * hx,
                        subject_rect_.height + 2 * hy);
-            s &= cv::Rect(0, 0, width, height);
-            if (s.area() > 0) mask_cpu(s) = 0;
+            cv::Rect s_half(s.x / HALF_RES_SCALE, s.y / HALF_RES_SCALE,
+                            s.width  / HALF_RES_SCALE, s.height / HALF_RES_SCALE);
+            s_half &= cv::Rect(0, 0, hw, hh);
+            if (s_half.area() > 0) mask_cpu(s_half) = 0;
         }
         mask_gpu_.upload(mask_cpu);
         mask_built_ = true;
@@ -339,11 +364,15 @@ public:
         if (!mask_built_)
             buildMask(frame.cols, frame.rows);
 
-        // ── 1. Upload to GPU and convert to gray (reused buffers) ─────────
+        // ── 1. Upload to GPU, downscale, convert to gray (half-res) ──────
+        // ORB + RANSAC + Farneback all operate at half resolution; the warp
+        // applies on the full-res frame at the end.  Camera motion is rigid
+        // so estimating it at half-res loses essentially no precision.
         if (!skip_upload_) gpu_frame_.upload(frame);
-        cv::cuda::cvtColor(gpu_frame_, gpu_gray_, cv::COLOR_BGR2GRAY);
+        cv::cuda::pyrDown(gpu_frame_, gpu_half_);
+        cv::cuda::cvtColor(gpu_half_, gpu_gray_, cv::COLOR_BGR2GRAY);
 
-        // ── 2. CUDA ORB detection ─────────────────────────────────────────
+        // ── 2. CUDA ORB detection (on half-res gray) ─────────────────────
         orb_gpu_->detectAndComputeAsync(gpu_gray_, mask_gpu_,
                                         gpu_kps_mat_, gpu_desc_, false, stream_);
         stream_.waitForCompletion();
@@ -453,10 +482,13 @@ public:
             H_total = last_valid_H_;
         }
 
-        // ── 5. Decompose H ─────────────────────────────────────────────────
+        // ── 5. Decompose H (in HALF-res coords; scale translation to full-res) ──
         if (!H_total.empty()) {
-            m.tx           = H_total.at<double>(0, 2);
-            m.ty           = H_total.at<double>(1, 2);
+            // For an affine T(x) = Mx + t, going from half-res to full-res:
+            // T_full(x) = 2 * T_half(x/2) = M*x + 2*t.  Linear part unchanged,
+            // translation scaled by HALF_RES_SCALE.
+            m.tx           = H_total.at<double>(0, 2) * HALF_RES_SCALE;
+            m.ty           = H_total.at<double>(1, 2) * HALF_RES_SCALE;
             m.scale        = std::sqrt(H_total.at<double>(0,0)*H_total.at<double>(0,0) +
                                        H_total.at<double>(1,0)*H_total.at<double>(1,0));
             double raw_rot = std::atan2(H_total.at<double>(1,0),
@@ -568,12 +600,13 @@ private:
     cv::cuda::Stream stream_;
 
     // Reused per-frame GPU buffers (preallocate → no per-frame cudaMalloc)
-    cv::cuda::GpuMat gpu_frame_;
-    cv::cuda::GpuMat gpu_gray_;
+    cv::cuda::GpuMat gpu_frame_;       // full-res BGR
+    cv::cuda::GpuMat gpu_half_;        // half-res BGR (pyrDown result)
+    cv::cuda::GpuMat gpu_gray_;        // half-res grayscale (input to ORB)
     cv::cuda::GpuMat gpu_kps_mat_;
     cv::cuda::GpuMat gpu_desc_;
-    cv::cuda::GpuMat gpu_stabilized_;  // stage-1 warp result (BGR)
-    cv::Mat H_smooth_;                 // stage-1 transform (3x3)
+    cv::cuda::GpuMat gpu_stabilized_;  // stage-1 warp result (BGR, full-res)
+    cv::Mat H_smooth_;                 // stage-1 transform in FULL-res coords
 
     bool initialized_ = false;
     bool mask_built_ = false;
