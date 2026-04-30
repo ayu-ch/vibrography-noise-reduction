@@ -62,6 +62,16 @@ static constexpr double MATCH_QUALITY_KEEP = 0.60;
 // videos have no marker, saves ~0.5–1 ms/frame).
 static constexpr int    ARUCO_PROBE_FRAMES = 100;
 
+// ── Kalman noise covariances (8-state constant-velocity model) ──────────────
+// Process noise (Q) — diagonal: position rows small, velocity rows larger.
+// Tuned for 1000 fps where velocity changes slowly between frames.
+static constexpr double KF_Q_POS    = 1e-4;   // tx, ty, rot, scale drift
+static constexpr double KF_Q_VEL    = 1e-2;   // dtx, dty, drot, dscale drift
+// Measurement noise (R) — typical RANSAC residual std on this dataset.
+static constexpr double KF_R_TXY    = 0.01;   // px²
+static constexpr double KF_R_ROT    = 1e-6;   // deg²
+static constexpr double KF_R_SCALE  = 1e-8;
+
 
 struct DisplacementData {
     int frame_id;
@@ -69,6 +79,74 @@ struct DisplacementData {
     cv::Point2f ground_truth_displacement;
     double error_magnitude;
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Kalman Feedforward — predicts next-frame H from a constant-velocity model
+//
+//  State (8-d):     [tx, ty, rot_deg, scale, dtx, dty, drot, dscale]
+//  Measurement (4): [tx, ty, rot_deg, scale] from RANSAC+Farneback
+//
+//  In batch mode this records the prediction to CSV for analysis but the warp
+//  still uses the measured values — output is bit-identical to non-Kalman runs.
+//  In live mode (future) the predicted state would be applied to the warp
+//  immediately on frame capture; the measurement only updates the filter.
+// ─────────────────────────────────────────────────────────────────────────────
+class KalmanH {
+public:
+    KalmanH() : kf_(8, 4, 0, CV_64F) {
+        // Constant-velocity transition: x_{t+1} = x_t + v_t, v_{t+1} = v_t
+        kf_.transitionMatrix = cv::Mat::eye(8, 8, CV_64F);
+        for (int i = 0; i < 4; i++) kf_.transitionMatrix.at<double>(i, 4 + i) = 1.0;
+
+        // Measurement matrix: only the position 4-tuple is observed
+        kf_.measurementMatrix = cv::Mat::zeros(4, 8, CV_64F);
+        for (int i = 0; i < 4; i++) kf_.measurementMatrix.at<double>(i, i) = 1.0;
+
+        // Process noise: small position drift, larger velocity drift
+        kf_.processNoiseCov = cv::Mat::eye(8, 8, CV_64F);
+        for (int i = 0; i < 4; i++) kf_.processNoiseCov.at<double>(i, i) = KF_Q_POS;
+        for (int i = 4; i < 8; i++) kf_.processNoiseCov.at<double>(i, i) = KF_Q_VEL;
+
+        // Measurement noise (per-component): tx/ty in px², rot in deg², scale
+        kf_.measurementNoiseCov = cv::Mat::eye(4, 4, CV_64F);
+        kf_.measurementNoiseCov.at<double>(0, 0) = KF_R_TXY;
+        kf_.measurementNoiseCov.at<double>(1, 1) = KF_R_TXY;
+        kf_.measurementNoiseCov.at<double>(2, 2) = KF_R_ROT;
+        kf_.measurementNoiseCov.at<double>(3, 3) = KF_R_SCALE;
+
+        // Initial covariance: large (we don't know state)
+        cv::setIdentity(kf_.errorCovPost, cv::Scalar(1.0));
+    }
+
+    void initState(double tx, double ty, double rot_deg, double scale) {
+        kf_.statePost.at<double>(0) = tx;
+        kf_.statePost.at<double>(1) = ty;
+        kf_.statePost.at<double>(2) = rot_deg;
+        kf_.statePost.at<double>(3) = scale;
+        for (int i = 4; i < 8; i++) kf_.statePost.at<double>(i) = 0.0;
+        initialized_ = true;
+    }
+
+    // Returns the predicted [tx, ty, rot_deg, scale] for the current frame
+    // (call before update()).
+    cv::Vec4d predict() {
+        cv::Mat p = kf_.predict();
+        return cv::Vec4d(p.at<double>(0), p.at<double>(1),
+                         p.at<double>(2), p.at<double>(3));
+    }
+
+    void update(double tx, double ty, double rot_deg, double scale) {
+        cv::Mat m = (cv::Mat_<double>(4, 1) << tx, ty, rot_deg, scale);
+        kf_.correct(m);
+    }
+
+    bool isInitialized() const { return initialized_; }
+
+private:
+    cv::KalmanFilter kf_;
+    bool initialized_ = false;
+};
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Stage 2 — Farneback Dense Optical Flow Residual Correction
@@ -292,6 +370,12 @@ public:
         // Stage 2 Farneback residual correction
         double farneback_dx = 0.0;
         double farneback_dy = 0.0;
+        // Kalman feedforward prediction (logged for analysis; not applied to
+        // warp in batch mode).
+        double pred_tx = 0.0;
+        double pred_ty = 0.0;
+        double pred_rotation_deg = 0.0;
+        double pred_scale = 1.0;
     };
 
     RansacStabilizer()
@@ -501,6 +585,25 @@ public:
                 rot_buffer_.erase(rot_buffer_.begin());
             m.rotation_deg = std::accumulate(rot_buffer_.begin(), rot_buffer_.end(), 0.0)
                            / static_cast<double>(rot_buffer_.size());
+
+            // ── Kalman feedforward ─────────────────────────────────────────
+            // predict() before update() advances the constant-velocity model.
+            // In batch we record the prediction; in live mode this is what
+            // would be applied to the warp immediately on frame capture.
+            if (!kalman_.isInitialized()) {
+                kalman_.initState(m.tx, m.ty, m.rotation_deg, m.scale);
+                m.pred_tx           = m.tx;
+                m.pred_ty           = m.ty;
+                m.pred_rotation_deg = m.rotation_deg;
+                m.pred_scale        = m.scale;
+            } else {
+                cv::Vec4d p = kalman_.predict();
+                m.pred_tx           = p[0];
+                m.pred_ty           = p[1];
+                m.pred_rotation_deg = p[2];
+                m.pred_scale        = p[3];
+                kalman_.update(m.tx, m.ty, m.rotation_deg, m.scale);
+            }
         }
 
         // ── 6. Reconstruct smoothed H and apply warp ──────────────────────
@@ -618,6 +721,7 @@ private:
     cv::Mat H_accumulated_;       // keyframe → frame 0
     cv::Mat last_valid_H_;        // last good total H (fallback)
     std::vector<double> rot_buffer_;  // rotation smoothing buffer
+    KalmanH kalman_;                  // 8-state CV feedforward (live-mode prep)
 };
 
 
@@ -840,7 +944,8 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
     csv << "frame_id,tx_px,ty_px,rotation_deg,scale,"
            "keypoints_found,good_matches,inliers,homography_valid,"
            "farneback_dx,farneback_dy,"
-           "aruco_detected,aruco_center_x,aruco_center_y\n";
+           "aruco_detected,aruco_center_x,aruco_center_y,"
+           "pred_tx,pred_ty,pred_rotation_deg,pred_scale\n";
 
     // Try NVENC writer first (H.264-in-AVI); fall back to CPU MJPEG.
     cv::Ptr<cv::cudacodec::VideoWriter> nvenc_writer;
@@ -955,7 +1060,9 @@ void processVideo(const std::string& video_path, const std::string& output_dir,
             << m.homography_valid << ","
             << m.farneback_dx << "," << m.farneback_dy << ","
             << m.aruco_detected << ","
-            << m.aruco_center.x << "," << m.aruco_center.y << "\n";
+            << m.aruco_center.x << "," << m.aruco_center.y << ","
+            << m.pred_tx << "," << m.pred_ty << ","
+            << m.pred_rotation_deg << "," << m.pred_scale << "\n";
 
         frame_idx++;
     }
